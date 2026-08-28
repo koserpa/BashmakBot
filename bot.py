@@ -8,12 +8,14 @@ from pathlib import Path
 
 import docx
 import openpyxl
+import requests
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiohttp import web
+from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 from google import genai
 from google.genai import errors, types
@@ -37,32 +39,104 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Словник тригерів, які вмикають вебпошук
-SEARCH_TRIGGERS = {
-    "знайди", "гугл", "пошукай", "новини", "погода",
-    "курс", "сьогодні", "актуальн", "інтернет", "найди", "search", "google"
-}
+# Словник тригерів більше не потрібен для рішення "шукати чи ні" —
+# тепер це вирішує сама модель через function calling (нижче).
+# Але список тригер-імен бота (TRIGGER_NAMES) лишається для was_mentioned().
+
+MAX_SEARCH_RESULTS = 5
+MAX_FETCH_CHARS = 12000
 
 
-def needs_web_search(text: str) -> bool:
-    """Перевіряє, чи містить запит слова-тригери для пошуку в інтернеті."""
-    text_lower = text.lower()
-    return any(trigger in text_lower for trigger in SEARCH_TRIGGERS)
-
-
-def get_web_results(query: str) -> str:
-    """Отримує результати з інтернету через DuckDuckGo безкоштовно та без лімітів API."""
+def web_search_tool(query: str) -> str:
+    """Пошук у DuckDuckGo (безкоштовно, без API-ключа). Повертає заголовки,
+    короткі описи та посилання — модель сама вирішує, чи треба відкрити
+    якесь із посилань через web_fetch_tool для повного тексту."""
     try:
-        results = DDGS().text(query, max_results=3)
+        results = DDGS().text(query, max_results=MAX_SEARCH_RESULTS)
         if not results:
-            return ""
-        snippet = "\n\n[Знайдена актуальна інформація з інтернету]:\n"
+            return "Пошук не дав результатів."
+        lines = []
         for r in results:
-            snippet += f"- {r.get('title', '')}: {r.get('body', '')}\n"
-        return snippet
+            lines.append(
+                f"- {r.get('title', '')}\n"
+                f"  URL: {r.get('href', '')}\n"
+                f"  {r.get('body', '')}"
+            )
+        return "\n".join(lines)
     except Exception as e:
         log.error(f"Помилка пошуку DuckDuckGo: {e}")
-        return ""
+        return f"Помилка пошуку: {e}"
+
+
+def web_fetch_tool(url: str) -> str:
+    """Завантажує сторінку за URL і повертає очищений текст (без HTML-тегів,
+    скриптів, стилів). Використовується моделлю, коли потрібен повний
+    контент статті, а не лише короткий сніпет з пошуку."""
+    try:
+        resp = requests.get(
+            url,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"},
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+            tag.decompose()
+        text = " ".join(soup.get_text(separator=" ").split())
+        if len(text) > MAX_FETCH_CHARS:
+            text = text[:MAX_FETCH_CHARS] + "...[текст обрізано]"
+        return text or "Сторінка порожня або не містить тексту."
+    except Exception as e:
+        log.error(f"Помилка завантаження {url}: {e}")
+        return f"Не вдалося завантажити сторінку: {e}"
+
+
+SEARCH_TOOLS = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="web_search",
+            description=(
+                "Пошук актуальної інформації в інтернеті через DuckDuckGo. "
+                "Використовуй, коли потрібні свіжі дані: новини, погода, "
+                "курси валют, поточні події, факти, яких немає в контексті "
+                "розмови."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "query": types.Schema(
+                        type=types.Type.STRING,
+                        description="Пошуковий запит",
+                    ),
+                },
+                required=["query"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="web_fetch",
+            description=(
+                "Завантажує і повертає повний текст сторінки за URL. "
+                "Використовуй, коли короткого сніпету з web_search "
+                "недостатньо і потрібен повний зміст статті/сторінки."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "url": types.Schema(
+                        type=types.Type.STRING,
+                        description="Повна URL-адреса сторінки",
+                    ),
+                },
+                required=["url"],
+            ),
+        ),
+    ]
+)
+
+TOOL_EXECUTORS = {
+    "web_search": lambda args: web_search_tool(args.get("query", "")),
+    "web_fetch": lambda args: web_fetch_tool(args.get("url", "")),
+}
 
 
 # chat_id -> deque of {"role": ..., "content": ...}
@@ -109,22 +183,72 @@ def was_mentioned(message: Message, bot_username: str) -> bool:
     return False
 
 
+MAX_TOOL_ROUNDS = 4
+
+
 async def ask_gemini(contents: list) -> str:
-    """Викликає Gemini API без нативних tools (щоб уникнути помилок 429)."""
+    """Викликає Gemini з підтримкою function calling (web_search / web_fetch).
+    Модель сама вирішує, чи потрібен пошук в інтернеті, і скільки разів."""
+    contents = list(contents)  # не мутуємо історію чату напряму
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT
+        + " У переписці повідомлення користувачів позначені як "
+          "'Ім'я: текст' — звертай увагу, хто саме що написав, "
+          "але у своїй відповіді імена дублювати не треба. "
+          "Якщо для відповіді потрібні свіжі чи фактичні дані (новини, "
+          "погода, курси, поточні події тощо) — використовуй web_search, "
+          "а за потреби web_fetch для повного тексту сторінки.",
+        max_output_tokens=600,
+        temperature=0.7,
+        tools=[SEARCH_TOOLS],
+    )
+
     try:
-        response = await ai_client.aio.models.generate_content(
+        for _ in range(MAX_TOOL_ROUNDS):
+            response = await ai_client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=config,
+            )
+
+            candidate = response.candidates[0] if response.candidates else None
+            parts = candidate.content.parts if candidate and candidate.content else []
+            function_calls = [p for p in parts if getattr(p, "function_call", None)]
+
+            if not function_calls:
+                return (response.text or "").strip()
+
+            # Додаємо запит моделі на виклик функцій в історію цього обміну
+            contents.append({"role": "model", "parts": parts})
+
+            function_response_parts = []
+            for part in function_calls:
+                fc = part.function_call
+                executor = TOOL_EXECUTORS.get(fc.name)
+                if executor:
+                    log.info(f"Gemini tool call: {fc.name}({dict(fc.args)})")
+                    result = executor(dict(fc.args))
+                else:
+                    result = f"Невідома функція: {fc.name}"
+                function_response_parts.append(
+                    types.Part.from_function_response(
+                        name=fc.name, response={"result": result}
+                    )
+                )
+
+            contents.append({"role": "user", "parts": function_response_parts})
+
+        # Ліміт раундів вичерпано — просимо фінальну відповідь без інструментів
+        final = await ai_client.aio.models.generate_content(
             model=GEMINI_MODEL,
             contents=contents,
             config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT
-                + " У переписці повідомлення користувачів позначені як "
-                  "'Ім'я: текст' — звертай увагу, хто саме що написав, "
-                  "але у своїй відповіді імена дублювати не треба.",
+                system_instruction=config.system_instruction,
                 max_output_tokens=600,
                 temperature=0.7,
             ),
         )
-        return (response.text or "").strip()
+        return (final.text or "").strip()
 
     except errors.ClientError as e:
         if e.code == 429:
@@ -240,10 +364,6 @@ async def handle_message(message: Message):
         question = "Привіт! Про що поговоримо?"
 
     full_prompt_text = f"{sender}: {question}"
-    if needs_web_search(question):
-        web_info = get_web_results(question)
-        if web_info:
-            full_prompt_text += web_info
 
     sender_context = get_sender_context(message)
     if sender_context:
@@ -299,10 +419,6 @@ async def handle_photo(message: Message):
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
     full_prompt_text = f"{sender}: {question}"
-    if needs_web_search(question):
-        web_info = get_web_results(question)
-        if web_info:
-            full_prompt_text += web_info
 
     sender_context = get_sender_context(message)
     if sender_context:
@@ -410,11 +526,6 @@ async def handle_voice(message: Message):
     if question:
         full_prompt_text += f"\n[Коментар до голосового]: {question}"
 
-    if needs_web_search(transcript):
-        web_info = get_web_results(transcript)
-        if web_info:
-            full_prompt_text += web_info
-
     sender_context = get_sender_context(message)
     if sender_context:
         full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
@@ -485,10 +596,6 @@ async def handle_document(message: Message):
     question = strip_trigger(caption, bot_username) or "Опрацюй цей файл і розкажи головне."
 
     full_prompt_text = f"{sender}: {question}\n\n[Файл: {file_name}]"
-    if needs_web_search(question):
-        web_info = get_web_results(question)
-        if web_info:
-            full_prompt_text += web_info
 
     sender_context = get_sender_context(message)
     if sender_context:
