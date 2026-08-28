@@ -1,6 +1,7 @@
 import asyncio
 import io
 import logging
+import os
 import re
 from collections import defaultdict, deque
 from pathlib import Path
@@ -12,6 +13,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
+from aiohttp import web
 from duckduckgo_search import DDGS
 from google import genai
 from google.genai import errors, types
@@ -524,6 +526,24 @@ async def handle_document(message: Message):
 async def main():
     print(f"Поточна модель в боті: {GEMINI_MODEL}")
     log.info("Бот запускається...")
+
+    # Koyeb (безкоштовний план) вимагає Web Service з відкритим портом —
+    # піднімаємо мінімальний HTTP-сервер для health-check поруч з polling'ом.
+    port = int(os.getenv("PORT", "8000"))
+
+    async def health(request):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    log.info(f"Health-check сервер запущено на порту {port}")
+
     await dp.start_polling(bot)
 
 
