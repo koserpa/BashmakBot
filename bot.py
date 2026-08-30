@@ -384,6 +384,290 @@ async def handle_photo(message: Message):
     await message.reply(answer)
 
 
+async def download_sticker_bytes(message: Message) -> bytes:
+    """Завантажує статичний (webp) стікер."""
+    sticker = message.sticker
+    file = await bot.get_file(sticker.file_id)
+    buffer = await bot.download_file(file.file_path)
+    return buffer.read()
+
+
+@dp.message(F.sticker)
+async def handle_sticker(message: Message):
+    me = await bot.get_me()
+    bot_username = me.username
+
+    chat_history = history[message.chat.id]
+    sender = message.from_user.full_name if message.from_user else "Хтось"
+    sticker = message.sticker
+    emoji = sticker.emoji or "🙂"
+
+    mentioned = was_mentioned(message, bot_username)
+
+    # анімовані (.tgs) і відео-стікери (.webm) Gemini vision напряму не їсть —
+    # фіксуємо тільки емодзі, без реального аналізу картинки
+    if sticker.is_animated or sticker.is_video:
+        if not mentioned:
+            chat_history.append(
+                {"role": "user", "parts": [{"text": f"{sender}: [анімований стікер {emoji}]"}]}
+            )
+            return
+
+        full_prompt_text = f"{sender}: [надіслав(-ла) анімований стікер {emoji}]"
+        sender_context = get_sender_context(message)
+        if sender_context:
+            full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
+
+        contents = list(chat_history)
+        contents.append({"role": "user", "parts": [{"text": full_prompt_text}]})
+
+        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+        try:
+            answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
+            answer = strip_name_prefix(answer, sender, me.full_name)
+        except Exception:
+            log.exception("AI request failed")
+            answer = "Вибач, сталася помилка при зверненні до AI 😔"
+
+        chat_history.append(
+            {"role": "user", "parts": [{"text": f"{sender}: [анімований стікер {emoji}]"}]}
+        )
+        chat_history.append({"role": "model", "parts": [{"text": answer}]})
+
+        await message.reply(answer)
+        return
+
+    # звичайний статичний стікер — webp, Gemini vision їсть напряму
+    try:
+        sticker_bytes = await download_sticker_bytes(message)
+    except Exception:
+        log.exception("Failed to download sticker")
+        if mentioned:
+            await message.reply("Не вдалось завантажити стікер 😔")
+        return
+
+    if not mentioned:
+        # без зайвого запиту до Gemini — просто фіксуємо факт і емодзі в історію
+        chat_history.append(
+            {"role": "user", "parts": [{"text": f"{sender}: [надіслав(-ла) стікер {emoji}]"}]}
+        )
+        return
+
+    full_prompt_text = f"{sender}: [надіслав(-ла) стікер, емодзі: {emoji}]"
+
+    sender_context = get_sender_context(message)
+    if sender_context:
+        full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
+
+    contents = list(chat_history)
+    contents.append(
+        {
+            "role": "user",
+            "parts": [
+                {"text": full_prompt_text},
+                types.Part.from_bytes(data=sticker_bytes, mime_type="image/webp"),
+            ],
+        }
+    )
+
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    try:
+        answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
+        answer = strip_name_prefix(answer, sender, me.full_name)
+    except Exception:
+        log.exception("AI request failed")
+        answer = "Вибач, сталася помилка при зверненні до AI 😔"
+
+    chat_history.append(
+        {"role": "user", "parts": [{"text": f"{sender}: [надіслав(-ла) стікер {emoji}]"}]}
+    )
+    chat_history.append({"role": "model", "parts": [{"text": answer}]})
+
+    await message.reply(answer)
+
+
+async def download_animation_bytes(message: Message) -> bytes:
+    """Завантажує gif/анімацію (по факту mp4 без звуку)."""
+    animation = message.animation
+    file = await bot.get_file(animation.file_id)
+    buffer = await bot.download_file(file.file_path)
+    return buffer.read()
+
+
+@dp.message(F.animation)
+async def handle_animation(message: Message):
+    """GIF в Telegram технічно приходить як mp4 без звуку (F.animation) —
+    gemini-3.1-flash-lite підтримує відео на вході, тож кидаємо файл напряму,
+    без потреби витягувати кадр через ffmpeg."""
+    me = await bot.get_me()
+    bot_username = me.username
+
+    chat_history = history[message.chat.id]
+    sender = message.from_user.full_name if message.from_user else "Хтось"
+    caption = message.caption or ""
+
+    mentioned = was_mentioned(message, bot_username)
+
+    if not mentioned:
+        note = f"{sender}: [надіслав(-ла) гіфку]"
+        if caption:
+            note += f" {caption}"
+        chat_history.append({"role": "user", "parts": [{"text": note}]})
+        return
+
+    animation = message.animation
+    if animation.file_size and animation.file_size > 20 * 1024 * 1024:
+        await message.reply("Гіфка більша за 20 МБ — стільки бот завантажити не може 😔")
+        return
+
+    try:
+        animation_bytes = await download_animation_bytes(message)
+    except Exception:
+        log.exception("Failed to download animation")
+        await message.reply("Не вдалось завантажити гіфку 😔")
+        return
+
+    question = strip_trigger(caption, bot_username) or "Що відбувається на цій гіфці?"
+
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    full_prompt_text = f"{sender}: {question}"
+    if needs_web_search(question):
+        web_info = get_web_context(question)
+        if web_info:
+            full_prompt_text += web_info
+
+    sender_context = get_sender_context(message)
+    if sender_context:
+        full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
+
+    contents = list(chat_history)
+    contents.append(
+        {
+            "role": "user",
+            "parts": [
+                {"text": full_prompt_text},
+                types.Part.from_bytes(data=animation_bytes, mime_type="video/mp4"),
+            ],
+        }
+    )
+
+    try:
+        answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
+        answer = strip_name_prefix(answer, sender, me.full_name)
+    except Exception:
+        log.exception("AI request failed")
+        answer = "Вибач, сталася помилка при зверненні до AI 😔"
+
+    chat_history.append(
+        {"role": "user", "parts": [{"text": f"{sender}: [гіфка] {question}"}]}
+    )
+    chat_history.append({"role": "model", "parts": [{"text": answer}]})
+
+    await message.reply(answer)
+
+
+async def download_video_note_bytes(message: Message) -> bytes:
+    """Завантажує відео кружка (mp4 зі звуком)."""
+    video_note = message.video_note
+    file = await bot.get_file(video_note.file_id)
+    buffer = await bot.download_file(file.file_path)
+    return buffer.read()
+
+
+@dp.message(F.video_note)
+async def handle_video_note(message: Message):
+    """Кружки (video_note): транскрибуємо мовлення так само, як голосові —
+    в історію і у відповідь йде тільки текст транскрипції, без самого відео."""
+    me = await bot.get_me()
+    bot_username = me.username
+
+    chat_history = history[message.chat.id]
+    sender = message.from_user.full_name if message.from_user else "Хтось"
+
+    mentioned = was_mentioned(message, bot_username)
+
+    try:
+        video_note_bytes = await download_video_note_bytes(message)
+    except Exception:
+        log.exception("Failed to download video note")
+        if mentioned:
+            await message.reply("Не вдалось завантажити кружок 😔")
+        return
+
+    transcript_contents = [
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "text": "Транскрибуй мовлення з цього відео дослівно, "
+                    "тією мовою, якою його промовлено. У відповідь дай ТІЛЬКИ "
+                    "текст транскрипції, без жодних коментарів чи лапок."
+                },
+                types.Part.from_bytes(data=video_note_bytes, mime_type="video/mp4"),
+            ],
+        }
+    ]
+
+    try:
+        response = await ai_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=transcript_contents,
+            config=types.GenerateContentConfig(max_output_tokens=400, temperature=0.2),
+        )
+        transcript = (response.text or "").strip()
+    except Exception:
+        log.exception("Video note transcription failed")
+        transcript = ""
+
+    if not transcript:
+        if mentioned:
+            await message.reply("Не вдалось розпізнати кружок 😔")
+        else:
+            chat_history.append(
+                {"role": "user", "parts": [{"text": f"{sender}: [кружок]"}]}
+            )
+        return
+
+    if not mentioned:
+        chat_history.append(
+            {"role": "user", "parts": [{"text": f"{sender}: [кружок] {transcript}"}]}
+        )
+        return
+
+    full_prompt_text = f"{sender}: {transcript}"
+
+    if needs_web_search(transcript):
+        web_info = get_web_context(transcript)
+        if web_info:
+            full_prompt_text += web_info
+
+    sender_context = get_sender_context(message)
+    if sender_context:
+        full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
+
+    contents = list(chat_history)
+    contents.append({"role": "user", "parts": [{"text": full_prompt_text}]})
+
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    try:
+        answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
+        answer = strip_name_prefix(answer, sender, me.full_name)
+    except Exception:
+        log.exception("AI request failed")
+        answer = "Вибач, сталася помилка при зверненні до AI 😔"
+
+    chat_history.append(
+        {"role": "user", "parts": [{"text": f"{sender}: [кружок] {transcript}"}]}
+    )
+    chat_history.append({"role": "model", "parts": [{"text": answer}]})
+
+    await message.reply(answer)
+
+
 async def download_voice_bytes(message: Message) -> bytes:
     """Завантажує аудіо голосового повідомлення (ogg/opus)."""
     voice = message.voice
