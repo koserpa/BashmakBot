@@ -2,6 +2,7 @@ import asyncio
 import io
 import logging
 import os
+import random
 import re
 import time
 from collections import defaultdict, deque
@@ -109,13 +110,22 @@ REACTION_PREFIX = "REACTION:"
 # Якщо в чаті тиша довше IDLE_HOURS годин — бот раз може сам щось написати
 # (без згадки), а потім чекає нової активності від людей, перш ніж це
 # зможе повторитися знову (щоб не спамити в мертвий чат щогодини).
-IDLE_HOURS = float(os.getenv("IDLE_HOURS", "12"))
+IDLE_HOURS = float(os.getenv("IDLE_HOURS", "7"))
 IDLE_CHECK_INTERVAL_SEC = 15 * 60
 
 # chat_id -> час останнього повідомлення від людини (time.time())
 last_human_activity: dict[int, float] = {}
 # chat_id -> чи вже "вистрелили" проактивним повідомленням за цей період тиші
 idle_message_sent: dict[int, bool] = {}
+
+# --- Реакції на повідомлення без тегу бота -------------------------------
+# Незалежно від того, тегнули бота чи ні, він може іноді (не на кожне
+# повідомлення) поставити емодзі-реакцію, якщо вважає це доречним.
+# Рішення "доречно чи ні" приймає сама модель окремим дешевим запитом
+# (max_output_tokens=10), а ймовірність нижче — це фільтр ДО запиту, щоб
+# не смикати API на кожну репліку в чаті.
+REACT_UNPROMPTED_ENABLED = os.getenv("REACT_UNPROMPTED_ENABLED", "true").lower() == "true"
+REACT_UNPROMPTED_CHANCE = float(os.getenv("REACT_UNPROMPTED_CHANCE", "0.35"))
 
 
 def needs_web_search(text: str) -> bool:
@@ -266,7 +276,17 @@ async def ask_gemini(contents: list) -> str:
                       "Якщо у повідомленні через @ тегнуто кількох людей "
                       "одразу (і для них є [Про згаданих людей] в промпті) — "
                       "можеш відповісти, врахувавши обох/усіх, а не тільки "
-                      "того, хто писав.",
+                      "того, хто писав. "
+                      ""
+                      "Коли тобі надсилають фото, стікер, гіфку, голосове чи "
+                      "файл (зокрема через reply на чиєсь повідомлення з "
+                      "позначкою '[у відповідь на ...]') — НЕ роби сухий "
+                      "'звіт' про вміст. Реагуй на це як жива людина в "
+                      "переписці: постьобатися, здивуватись, оцінити, "
+                      "прокоментувати по суті — залежно від того, що на "
+                      "фото/в файлі і в якому режимі тону зараз розмова. "
+                      "Опис вмісту — лише якщо він реально потрібен для "
+                      "відповіді, а не сама мета відповіді.",
                     max_output_tokens=600,
                     temperature=0.7,
                 ),
@@ -407,6 +427,128 @@ def extract_document_text(file_name: str, data: bytes, mime_type: str | None):
     return None, None
 
 
+async def build_reply_media_context(replied: Message) -> tuple[list, str]:
+    """Якщо повідомлення, на яке відповіли (reply), містить фото/стікер/
+    гіфку/файл/голосове/кружок — підвантажує цей вміст і повертає
+    (extra_parts, опис для промпту). Завдяки цьому 'reply на фото + тег
+    бота в тексті' сприймається так само, ніби фото щойно надіслали й
+    одразу тегнули бота під ним."""
+    extra_parts: list = []
+    description = ""
+
+    try:
+        if replied.photo:
+            photo = replied.photo[-1]
+            file = await bot.get_file(photo.file_id)
+            buffer = await bot.download_file(file.file_path)
+            extra_parts.append(types.Part.from_bytes(data=buffer.read(), mime_type="image/jpeg"))
+            description = "[у відповідь на фото]"
+            if replied.caption:
+                description += f" (підпис до фото: {replied.caption})"
+
+        elif replied.sticker and not (replied.sticker.is_animated or replied.sticker.is_video):
+            file = await bot.get_file(replied.sticker.file_id)
+            buffer = await bot.download_file(file.file_path)
+            extra_parts.append(types.Part.from_bytes(data=buffer.read(), mime_type="image/webp"))
+            description = f"[у відповідь на стікер {replied.sticker.emoji or ''}]"
+
+        elif replied.sticker:
+            # анімовані/відео-стікери vision не читає — тільки емодзі
+            description = f"[у відповідь на анімований стікер {replied.sticker.emoji or ''}]"
+
+        elif replied.animation:
+            file = await bot.get_file(replied.animation.file_id)
+            buffer = await bot.download_file(file.file_path)
+            extra_parts.append(types.Part.from_bytes(data=buffer.read(), mime_type="video/mp4"))
+            description = "[у відповідь на гіфку]"
+            if replied.caption:
+                description += f" (підпис до гіфки: {replied.caption})"
+
+        elif replied.document:
+            file_name = replied.document.file_name or "файл"
+            file = await bot.get_file(replied.document.file_id)
+            buffer = await bot.download_file(file.file_path)
+            data = buffer.read()
+            text_content, raw_part = extract_document_text(file_name, data, replied.document.mime_type)
+            description = f"[у відповідь на файл {file_name}]"
+            if raw_part is not None:
+                extra_parts.append(raw_part)
+            elif text_content:
+                trimmed = text_content[:MAX_DOC_CHARS]
+                if len(text_content) > MAX_DOC_CHARS:
+                    trimmed += "\n...[текст обрізано, файл завеликий]"
+                description += f"\nВміст файлу:\n{trimmed}"
+            else:
+                description += " (формат файлу не підтримується)"
+
+        elif replied.voice:
+            file = await bot.get_file(replied.voice.file_id)
+            buffer = await bot.download_file(file.file_path)
+            transcript = await transcribe_media(buffer.read(), "audio/ogg", "voice-reply")
+            if transcript:
+                description = f"[у відповідь на голосове]: {transcript}"
+
+        elif replied.video_note:
+            file = await bot.get_file(replied.video_note.file_id)
+            buffer = await bot.download_file(file.file_path)
+            transcript = await transcribe_media(buffer.read(), "video/mp4", "video_note-reply")
+            if transcript:
+                description = f"[у відповідь на кружок]: {transcript}"
+
+    except Exception:
+        log.exception("Не вдалось підвантажити медіа з reply_to_message")
+        return [], ""
+
+    return extra_parts, description
+
+
+async def maybe_react_unprompted(message: Message, sender: str, content_text: str) -> None:
+    """Може поставити емодзі-реакцію на будь-яке повідомлення, навіть якщо
+    бота не тегали — вибірково і лише коли це реально доречно. Викликається
+    як fire-and-forget задача, нічого не пише в чат і не чіпає history."""
+    if not REACT_UNPROMPTED_ENABLED:
+        return
+    if not content_text or not content_text.strip():
+        return
+    if random.random() > REACT_UNPROMPTED_CHANCE:
+        return
+
+    prompt = (
+        f"Повідомлення в чаті від {sender}: \"{content_text}\"\n\n"
+        "Чи варто відреагувати на нього емодзі-реакцією (без тексту)? "
+        "Це доречно ЛИШЕ для дійсно яскравих випадків: дуже смішне, "
+        "шокуюче, влучне, драма, класна новина, бʼющий факап тощо. "
+        "Для нейтральних, буденних чи незрозумілих повідомлень — реакція "
+        "НЕ потрібна, це має бути рідкісна дія, а не звичка. "
+        "Якщо доречно — виведи РІВНО ОДНЕ емодзі з цього списку: "
+        + " ".join(sorted(ALLOWED_REACTIONS))
+        + ". Якщо ні — виведи рівно слово NONE. Без пояснень і зайвих символів."
+    )
+
+    try:
+        response = await ai_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[{"role": "user", "parts": [{"text": prompt}]}],
+            config=types.GenerateContentConfig(max_output_tokens=10, temperature=0.4),
+        )
+        answer = (response.text or "").strip()
+    except Exception:
+        log.exception("Не вдалось перевірити доречність незапитаної реакції")
+        return
+
+    if answer not in ALLOWED_REACTIONS:
+        return
+
+    try:
+        await bot.set_message_reaction(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            reaction=[ReactionTypeEmoji(emoji=answer)],
+        )
+    except Exception:
+        log.exception("Не вдалось поставити незапитану реакцію")
+
+
 # ---------------------------------------------------------------------------
 # Спільна логіка для всіх типів повідомлень.
 #
@@ -490,10 +632,12 @@ async def process_and_reply(
 
 def remember_only(message: Message, sender: str, note: str) -> None:
     """Записує подію в історію чату без звернення до Gemini (коли бота не
-    згадали)."""
+    згадали). Додатково запускає фонову перевірку — чи не варто все ж
+    відреагувати емодзі на це повідомлення (без тегу)."""
     history[message.chat.id].append(
         {"role": "user", "parts": [{"text": f"{sender}: {note}"}]}
     )
+    asyncio.create_task(maybe_react_unprompted(message, sender, note))
 
 
 async def send_idle_message(chat_id: int) -> None:
@@ -594,7 +738,22 @@ async def handle_message(message: Message):
     if not question:
         question = "Привіт! Про що поговоримо?"
 
-    await process_and_reply(message, sender, question, history_label=question)
+    # Якщо це reply на чиєсь фото/стікер/гіфку/файл/голосове/кружок і в
+    # тексті тегнули бота — підвантажуємо той медіа-контент, щоб бот
+    # сприйняв це так, ніби йому щойно надіслали й одразу тегнули.
+    extra_parts: list = []
+    replied = message.reply_to_message
+    if replied and (not replied.from_user or replied.from_user.id != BOT_ID):
+        reply_parts, reply_description = await build_reply_media_context(replied)
+        if reply_description:
+            question = f"{question}\n{reply_description}" if question else reply_description
+            extra_parts = reply_parts
+
+    await process_and_reply(
+        message, sender, question,
+        extra_parts=extra_parts or None,
+        history_label=question,
+    )
 
 
 @dp.message(F.photo)
