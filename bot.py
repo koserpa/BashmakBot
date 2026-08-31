@@ -3,6 +3,7 @@ import io
 import logging
 import os
 import re
+import time
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, ReactionTypeEmoji
 from aiohttp import web
 from bs4 import BeautifulSoup
 from ddgs import DDGS
@@ -39,19 +40,82 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
+
+@dp.message.outer_middleware()
+async def track_activity_middleware(handler, message: Message, data: dict):
+    """Фіксує будь-яке повідомлення від людини в чаті — потрібно окремо від
+    основних хендлерів, щоб не забути оновити активність в якомусь з них."""
+    if message.chat.type != "private":
+        last_human_activity[message.chat.id] = time.time()
+        idle_message_sent[message.chat.id] = False
+    return await handler(message, data)
+
+# Заповнюється один раз у main() під час старту — щоб не смикати get_me()
+# на кожне повідомлення.
+BOT_ID: int | None = None
+BOT_USERNAME: str = ""
+BOT_FULL_NAME: str = ""
+
+START_TIME = time.time()
+
 # Тригер-слова для автоматичного пошуку в інтернеті. Рішення "шукати чи ні"
 # приймається в коді напряму (детерміновано), а не моделлю через function
 # calling — той підхід виявився нестабільним з gemini-3.1-flash-lite.
 SEARCH_TRIGGERS = {
+    # укр
     "знайди", "гугл", "пошукай", "новини", "погода", "прогноз",
     "курс", "курси", "долар", "євро", "зарплат", "ціна", "ціни",
     "сьогодні", "зараз", "актуальн", "останні", "свіж",
-    "інтернет", "найди", "search", "google", "хто такий", "хто така",
+    "інтернет", "найди", "хто такий", "хто така",
     "коли", "скільки коштує", "де знаходиться", "що сталося", "що відбулось",
+    # рос (Влад і Саша частіше пишуть/отримують відповіді російською)
+    "найди", "погугли", "поищи", "новост", "прогноз погоды",
+    "курс", "доллар", "евро", "зарплат", "цена", "цены",
+    "сегодня", "сейчас", "актуальн", "последние", "свеж",
+    "интернет", "кто такой", "кто такая",
+    "когда", "сколько стоит", "где находится", "что случилось", "что произошло",
+    # універсальні / інші мови
+    "search", "google",
 }
 
 MAX_SEARCH_RESULTS = 5
 MAX_FETCH_CHARS = 6000
+MAX_DOC_CHARS = 40000
+
+# Скільки разів повторити запит до Gemini при тимчасових помилках
+# (мережа/сервер), перш ніж здатися.
+GEMINI_MAX_RETRIES = 2
+GEMINI_RETRY_DELAY = 2.0
+
+# Емодзі-реакції, дозволені Telegram Bot API для звичайних (не преміум)
+# ботів. Список неповний, але покриває базові емоції — цього достатньо,
+# щоб бот міг "просто лайкнути" замість писати текст.
+ALLOWED_REACTIONS = {
+    "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱",
+    "🤬", "😢", "🎉", "🤩", "🤮", "💩", "🙏", "👌", "🕊", "🤡",
+    "🥱", "🥴", "😍", "🐳", "❤‍🔥", "🌚", "🌭", "💯", "🤣", "⚡",
+    "🍌", "🏆", "💔", "🤨", "😐", "🍓", "🍾", "💋", "🖕", "😈",
+    "😴", "😭", "🤓", "👻", "👨‍💻", "👀", "🎃", "🙈", "😇", "😨",
+    "🤝", "✍", "🤗", "🫡", "🎅", "🎄", "☃", "💅", "🤪", "🗿",
+    "🆒", "💘", "🙉", "🦄", "😘", "💊", "🙊", "😎", "👾", "🤷‍♂",
+    "🤷", "🤷‍♀", "😡",
+}
+
+# Маркер, яким модель може позначити "хочу відповісти реакцією, а не
+# текстом" — детально в SYSTEM_PROMPT-доповненні в ask_gemini().
+REACTION_PREFIX = "REACTION:"
+
+# --- Проактивні повідомлення в тихому чаті ------------------------------
+# Якщо в чаті тиша довше IDLE_HOURS годин — бот раз може сам щось написати
+# (без згадки), а потім чекає нової активності від людей, перш ніж це
+# зможе повторитися знову (щоб не спамити в мертвий чат щогодини).
+IDLE_HOURS = float(os.getenv("IDLE_HOURS", "12"))
+IDLE_CHECK_INTERVAL_SEC = 15 * 60
+
+# chat_id -> час останнього повідомлення від людини (time.time())
+last_human_activity: dict[int, float] = {}
+# chat_id -> чи вже "вистрелили" проактивним повідомленням за цей період тиші
+idle_message_sent: dict[int, bool] = {}
 
 
 def needs_web_search(text: str) -> bool:
@@ -60,8 +124,7 @@ def needs_web_search(text: str) -> bool:
     return any(trigger in text_lower for trigger in SEARCH_TRIGGERS)
 
 
-def web_search_tool(query: str) -> list[dict]:
-    """Пошук у DuckDuckGo (безкоштовно, без API-ключа)."""
+def _web_search_sync(query: str) -> list[dict]:
     try:
         results = DDGS().text(query, max_results=MAX_SEARCH_RESULTS)
         return results or []
@@ -70,9 +133,7 @@ def web_search_tool(query: str) -> list[dict]:
         return []
 
 
-def web_fetch_tool(url: str) -> str:
-    """Завантажує сторінку за URL і повертає очищений текст (без HTML-тегів,
-    скриптів, стилів)."""
+def _web_fetch_sync(url: str) -> str:
     try:
         resp = requests.get(
             url,
@@ -92,10 +153,12 @@ def web_fetch_tool(url: str) -> str:
         return ""
 
 
-def get_web_context(query: str) -> str:
+async def get_web_context(query: str) -> str:
     """Робить пошук + підвантажує повний текст топ-результату.
-    Повертає готовий текстовий блок для вставки в промпт Gemini."""
-    results = web_search_tool(query)
+    Повертає готовий текстовий блок для вставки в промпт Gemini.
+    Синхронні мережеві виклики винесені в окремий тред, щоб не блокувати
+    event loop бота."""
+    results = await asyncio.to_thread(_web_search_sync, query)
     if not results:
         return ""
 
@@ -105,7 +168,7 @@ def get_web_context(query: str) -> str:
 
     top_url = results[0].get("href")
     if top_url:
-        full_text = web_fetch_tool(top_url)
+        full_text = await asyncio.to_thread(_web_fetch_sync, top_url)
         if full_text:
             lines.append(
                 f"\n[Повний текст першого джерела ({top_url})]:\n{full_text}"
@@ -139,17 +202,30 @@ def strip_name_prefix(text: str, sender: str, bot_name: str) -> str:
     return text.strip()
 
 
-def was_mentioned(message: Message, bot_username: str) -> bool:
+def parse_reaction_answer(answer: str) -> str | None:
+    """Якщо відповідь моделі — це маркер REACTION:<емодзі>, повертає сам
+    емодзі (якщо він у дозволеному списку). Інакше None."""
+    stripped = answer.strip()
+    if not stripped.startswith(REACTION_PREFIX):
+        return None
+    emoji = stripped[len(REACTION_PREFIX):].strip()
+    if emoji in ALLOWED_REACTIONS:
+        return emoji
+    log.warning(f"Модель попросила недозволену реакцію: {emoji!r}, ігнорую маркер")
+    return None
+
+
+def was_mentioned(message: Message) -> bool:
     text = message.text or message.caption
 
     if message.reply_to_message and message.reply_to_message.from_user:
-        if message.reply_to_message.from_user.id == bot.id:
+        if message.reply_to_message.from_user.id == BOT_ID:
             return True
 
     if not text:
         return False
 
-    if f"@{bot_username}".lower() in text.lower():
+    if BOT_USERNAME and f"@{BOT_USERNAME}".lower() in text.lower():
         return True
 
     if NAME_PATTERN.search(text):
@@ -160,39 +236,95 @@ def was_mentioned(message: Message, bot_username: str) -> bool:
 
 async def ask_gemini(contents: list) -> str:
     """Викликає Gemini API. Пошук в інтернеті вже підмішаний у текст промпту
-    заздалегідь (детерміновано, у хендлерах) — сюди він приходить готовим."""
+    заздалегідь (детерміновано, у хендлерах) — сюди він приходить готовим.
+    При тимчасових (мережа/сервер) помилках робить кілька повторних спроб."""
+    last_error: Exception | None = None
+
+    for attempt in range(GEMINI_MAX_RETRIES + 1):
+        try:
+            response = await ai_client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT
+                    + " У переписці повідомлення користувачів позначені як "
+                      "'Ім'я: текст' — звертай увагу, хто саме що написав, "
+                      "але у своїй відповіді імена дублювати не треба. "
+                      ""
+                      "ІНОДІ доречніше не писати текст, а просто поставити "
+                      "емодзі-реакцію на повідомлення (наприклад, коротке "
+                      "'ахах', 'лол', '+', 'згоден', жарт що не вартий "
+                      "розгорнутої відповіді, чи щось шокуюче/смішне). "
+                      "Якщо вирішив відповісти реакцією — виведи ЛИШЕ рядок "
+                      f"'{REACTION_PREFIX}<емодзі>' і нічого більше, без "
+                      "жодного тексту до чи після. Дозволені емодзі: "
+                      + " ".join(sorted(ALLOWED_REACTIONS))
+                      + ". Не зловживай цим — переважно все ж пиши звичайну "
+                        "текстову відповідь, реакція лише коли вона реально "
+                        "доречніша за слова. "
+                      ""
+                      "Якщо у повідомленні через @ тегнуто кількох людей "
+                      "одразу (і для них є [Про згаданих людей] в промпті) — "
+                      "можеш відповісти, врахувавши обох/усіх, а не тільки "
+                      "того, хто писав.",
+                    max_output_tokens=600,
+                    temperature=0.7,
+                ),
+            )
+            return (response.text or "").strip()
+
+        except errors.ClientError as e:
+            if e.code == 429:
+                log.warning("Запит відхилено: ліміт 429 (RESOURCE_EXHAUSTED)")
+                return "Зараз отримую занадто багато запитів 🤯. Зачекай 1-2 хвилини!"
+            log.error(f"Помилка Gemini API (ClientError, без повтору): {e}")
+            return "Виникла помилка при зверненні до AI 😔"
+
+        except errors.ServerError as e:
+            last_error = e
+            log.warning(
+                f"Тимчасова помилка Gemini API (спроба {attempt + 1}/"
+                f"{GEMINI_MAX_RETRIES + 1}): {e}"
+            )
+        except Exception as e:
+            last_error = e
+            log.warning(
+                f"Несподівана помилка в ask_gemini (спроба {attempt + 1}/"
+                f"{GEMINI_MAX_RETRIES + 1}): {e}"
+            )
+
+        if attempt < GEMINI_MAX_RETRIES:
+            await asyncio.sleep(GEMINI_RETRY_DELAY)
+
+    log.error(f"ask_gemini: усі спроби вичерпано, остання помилка: {last_error}")
+    return "Не вдалося сформулювати відповідь 😔"
+
+
+async def transcribe_media(data: bytes, mime_type: str, kind_label: str) -> str:
+    """Спільна логіка транскрибування аудіо/відео (voice / video_note)."""
+    contents = [
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "text": "Транскрибуй мовлення з цього медіа дослівно, "
+                    "тією мовою, якою його промовлено. У відповідь дай ТІЛЬКИ "
+                    "текст транскрипції, без жодних коментарів чи лапок."
+                },
+                types.Part.from_bytes(data=data, mime_type=mime_type),
+            ],
+        }
+    ]
     try:
         response = await ai_client.aio.models.generate_content(
             model=GEMINI_MODEL,
             contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT
-                + " У переписці повідомлення користувачів позначені як "
-                  "'Ім'я: текст' — звертай увагу, хто саме що написав, "
-                  "але у своїй відповіді імена дублювати не треба.",
-                max_output_tokens=600,
-                temperature=0.7,
-            ),
+            config=types.GenerateContentConfig(max_output_tokens=400, temperature=0.2),
         )
         return (response.text or "").strip()
-
-    except errors.ClientError as e:
-        if e.code == 429:
-            log.warning("Запит відхилено: ліміт 429 (RESOURCE_EXHAUSTED)")
-            return "Зараз отримую занадто багато запитів 🤯. Зачекай 1-2 хвилини!"
-        log.error(f"Помилка Gemini API: {e}")
-        return "Виникла помилка при зверненні до AI 😔"
-    except Exception as e:
-        log.error(f"Несподівана помилка в ask_gemini: {e}")
-        return "Не вдалося сформулювати відповідь 😔"
-
-
-async def download_photo_bytes(message: Message) -> bytes:
-    """Завантажує найбільшу доступну версію фото з повідомлення."""
-    photo = message.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    buffer = await bot.download_file(file.file_path)
-    return buffer.read()
+    except Exception:
+        log.exception(f"Транскрибування ({kind_label}) не вдалося")
+        return ""
 
 
 def get_sender_context(message: Message) -> str:
@@ -206,7 +338,28 @@ def get_sender_context(message: Message) -> str:
     return ""
 
 
-MAX_DOC_CHARS = 40000
+def get_mentioned_users_context(text: str) -> str:
+    """Шукає в тексті @згадки відомих учасників (окрім самого бота) і
+    повертає для них контекст із USER_CONTEXT — щоб бот міг врахувати
+    кількох людей одразу, а не тільки того, хто написав повідомлення."""
+    if not text:
+        return ""
+
+    mentioned_usernames = set(re.findall(r"@(\w+)", text))
+    bot_username_lower = (BOT_USERNAME or "").lower()
+
+    blocks = []
+    for username in mentioned_usernames:
+        if username.lower() == bot_username_lower:
+            continue
+        for known_username, context in USER_CONTEXT.items():
+            if known_username.lower() == username.lower():
+                blocks.append(f"@{known_username}: {context}")
+                break
+
+    if not blocks:
+        return ""
+    return "\n[Про згаданих людей]:\n" + "\n".join(blocks)
 
 
 def extract_document_text(file_name: str, data: bytes, mime_type: str | None):
@@ -254,6 +407,150 @@ def extract_document_text(file_name: str, data: bytes, mime_type: str | None):
     return None, None
 
 
+# ---------------------------------------------------------------------------
+# Спільна логіка для всіх типів повідомлень.
+#
+# Кожен хендлер (текст/фото/стікер/гіфка/кружок/голосове/документ) робить
+# по суті одне й те саме: сформувати текстовий опис події, за потреби додати
+# веб-контекст і контекст про відправника, звернутись до Gemini і записати
+# результат в історію чату. Різниця лише в тому, як саме будується
+# "сирий" контент (question_text) і які додаткові Part-и (фото/відео/файл)
+# додаються в запит.
+# ---------------------------------------------------------------------------
+
+
+async def process_and_reply(
+    message: Message,
+    sender: str,
+    question_text: str,
+    *,
+    extra_parts: list | None = None,
+    history_label: str,
+) -> None:
+    """Формує повний промпт, звертається до Gemini і відповідає в чат.
+    Викликається тільки коли бот був згаданий (mentioned=True)."""
+    chat_history = history[message.chat.id]
+
+    full_prompt_text = f"{sender}: {question_text}"
+    if needs_web_search(question_text):
+        web_info = await get_web_context(question_text)
+        if web_info:
+            full_prompt_text += web_info
+
+    sender_context = get_sender_context(message)
+    if sender_context:
+        full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
+
+    mentioned_context = get_mentioned_users_context(question_text)
+    if mentioned_context:
+        full_prompt_text += mentioned_context
+
+    parts = [{"text": full_prompt_text}]
+    if extra_parts:
+        parts.extend(extra_parts)
+
+    contents = list(chat_history)
+    contents.append({"role": "user", "parts": parts})
+
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    try:
+        answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
+        answer = strip_name_prefix(answer, sender, BOT_FULL_NAME)
+    except Exception:
+        log.exception("AI request failed")
+        answer = "Вибач, сталася помилка при зверненні до AI 😔"
+
+    chat_history.append(
+        {"role": "user", "parts": [{"text": f"{sender}: {history_label}"}]}
+    )
+
+    reaction_emoji = parse_reaction_answer(answer)
+    if reaction_emoji:
+        # В історію кладемо коротку текстову позначку, а не сирий маркер —
+        # інакше модель побачить "REACTION:🔥" в наступному контексті й
+        # може почати його копіювати як звичайний текст.
+        chat_history.append(
+            {"role": "model", "parts": [{"text": f"(відреагував {reaction_emoji})"}]}
+        )
+        try:
+            await bot.set_message_reaction(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                reaction=[ReactionTypeEmoji(emoji=reaction_emoji)],
+            )
+        except Exception:
+            log.exception("Не вдалось поставити реакцію, відповідаю текстом")
+            await message.reply(reaction_emoji)
+        return
+
+    chat_history.append({"role": "model", "parts": [{"text": answer}]})
+    await message.reply(answer)
+
+
+def remember_only(message: Message, sender: str, note: str) -> None:
+    """Записує подію в історію чату без звернення до Gemini (коли бота не
+    згадали)."""
+    history[message.chat.id].append(
+        {"role": "user", "parts": [{"text": f"{sender}: {note}"}]}
+    )
+
+
+async def send_idle_message(chat_id: int) -> None:
+    """Формує і надсилає одне проактивне повідомлення в тихий чат."""
+    chat_history = history[chat_id]
+    contents = list(chat_history)
+    contents.append(
+        {
+            "role": "user",
+            "parts": [{
+                "text": (
+                    f"[СИСТЕМНЕ]: у чаті тиша вже {IDLE_HOURS:.0f}+ годин. "
+                    "Напиши щось одне коротке від себе, щоб оживити чат — "
+                    "жарт, провокаційне питання чи коротку думку, за темою "
+                    "останніх повідомлень якщо вони були, у своєму "
+                    "звичному стилі. Рівно 1 речення. Без звернення до "
+                    "когось конкретного і без пояснень, що ти бот, що чат "
+                    "мовчав, чи щось подібне — просто природне повідомлення."
+                )
+            }],
+        }
+    )
+
+    answer = await ask_gemini(contents)
+    if not answer or parse_reaction_answer(answer):
+        # Реакцію тут ставити нема на що (це не відповідь комусь конкретно),
+        # тож у цьому випадку просто пропускаємо тик.
+        return
+
+    answer = strip_name_prefix(answer, "", BOT_FULL_NAME)
+    chat_history.append({"role": "model", "parts": [{"text": answer}]})
+    await bot.send_message(chat_id, answer)
+
+
+async def idle_chat_watcher():
+    """Раз на IDLE_CHECK_INTERVAL_SEC проходиться по відомих чатах: якщо
+    тиша довша за IDLE_HOURS і бот ще не писав за цей період тиші —
+    надсилає одне проактивне повідомлення."""
+    while True:
+        await asyncio.sleep(IDLE_CHECK_INTERVAL_SEC)
+        now = time.time()
+
+        for chat_id, last_active in list(last_human_activity.items()):
+            if idle_message_sent.get(chat_id):
+                continue
+            if now - last_active < IDLE_HOURS * 3600:
+                continue
+
+            # Ставимо прапорець одразу (до відправки), щоб не задвоїти
+            # повідомлення, якщо цей тик з якоїсь причини затягнеться.
+            idle_message_sent[chat_id] = True
+            try:
+                await send_idle_message(chat_id)
+            except Exception:
+                log.exception(f"Не вдалось надіслати проактивне повідомлення в чат {chat_id}")
+
+
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
     await message.answer(
@@ -269,178 +566,94 @@ async def cmd_reset(message: Message):
     await message.answer("Пам'ять цього чату очищена 🧹")
 
 
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    uptime_sec = int(time.time() - START_TIME)
+    hours, remainder = divmod(uptime_sec, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    chat_len = len(history[message.chat.id])
+
+    await message.answer(
+        "📊 Статус бота\n"
+        f"Модель: {GEMINI_MODEL}\n"
+        f"Uptime: {hours}г {minutes}хв {seconds}с\n"
+        f"Повідомлень в пам'яті цього чату: {chat_len}/{HISTORY_SIZE}"
+    )
+
+
 @dp.message(F.text)
 async def handle_message(message: Message):
-    me = await bot.get_me()
-    bot_username = me.username
-
-    chat_history = history[message.chat.id]
     sender = message.from_user.full_name if message.from_user else "Хтось"
-
-    mentioned = was_mentioned(message, bot_username)
+    mentioned = was_mentioned(message)
 
     if not mentioned:
-        chat_history.append(
-            {"role": "user", "parts": [{"text": f"{sender}: {message.text}"}]}
-        )
+        remember_only(message, sender, message.text)
         return
 
-    question = strip_trigger(message.text, bot_username)
+    question = strip_trigger(message.text, BOT_USERNAME)
     if not question:
         question = "Привіт! Про що поговоримо?"
 
-    full_prompt_text = f"{sender}: {question}"
-    if needs_web_search(question):
-        web_info = get_web_context(question)
-        if web_info:
-            full_prompt_text += web_info
-
-    sender_context = get_sender_context(message)
-    if sender_context:
-        full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
-
-    contents = list(chat_history)
-    contents.append(
-        {"role": "user", "parts": [{"text": full_prompt_text}]}
-    )
-
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    try:
-        answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
-        answer = strip_name_prefix(answer, sender, me.full_name)
-    except Exception:
-        log.exception("AI request failed")
-        answer = "Вибач, сталася помилка при зверненні до AI 😔"
-
-    chat_history.append({"role": "user", "parts": [{"text": f"{sender}: {question}"}]})
-    chat_history.append({"role": "model", "parts": [{"text": answer}]})
-
-    await message.reply(answer)
+    await process_and_reply(message, sender, question, history_label=question)
 
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    me = await bot.get_me()
-    bot_username = me.username
-
-    chat_history = history[message.chat.id]
     sender = message.from_user.full_name if message.from_user else "Хтось"
     caption = message.caption or ""
-
-    mentioned = was_mentioned(message, bot_username)
+    mentioned = was_mentioned(message)
 
     if not mentioned:
-        note = f"{sender}: [надіслав(-ла) фото]"
+        note = f"[надіслав(-ла) фото]"
         if caption:
             note += f" {caption}"
-        chat_history.append({"role": "user", "parts": [{"text": note}]})
+        remember_only(message, sender, note)
         return
 
-    question = strip_trigger(caption, bot_username) or "Що на цьому фото?"
+    question = strip_trigger(caption, BOT_USERNAME) or "Що на цьому фото?"
 
     try:
-        image_bytes = await download_photo_bytes(message)
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        buffer = await bot.download_file(file.file_path)
+        image_bytes = buffer.read()
     except Exception:
         log.exception("Failed to download photo")
         await message.reply("Не вдалось завантажити фото 😔")
         return
 
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    full_prompt_text = f"{sender}: {question}"
-    if needs_web_search(question):
-        web_info = get_web_context(question)
-        if web_info:
-            full_prompt_text += web_info
-
-    sender_context = get_sender_context(message)
-    if sender_context:
-        full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
-
-    contents = list(chat_history)
-    contents.append(
-        {
-            "role": "user",
-            "parts": [
-                {"text": full_prompt_text},
-                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-            ],
-        }
+    extra_parts = [types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")]
+    await process_and_reply(
+        message, sender, question,
+        extra_parts=extra_parts,
+        history_label=f"[фото] {question}",
     )
-
-    try:
-        answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
-        answer = strip_name_prefix(answer, sender, me.full_name)
-    except Exception:
-        log.exception("AI request failed")
-        answer = "Вибач, сталася помилка при зверненні до AI 😔"
-
-    chat_history.append(
-        {"role": "user", "parts": [{"text": f"{sender}: [фото] {question}"}]}
-    )
-    chat_history.append({"role": "model", "parts": [{"text": answer}]})
-
-    await message.reply(answer)
-
-
-async def download_sticker_bytes(message: Message) -> bytes:
-    """Завантажує статичний (webp) стікер."""
-    sticker = message.sticker
-    file = await bot.get_file(sticker.file_id)
-    buffer = await bot.download_file(file.file_path)
-    return buffer.read()
 
 
 @dp.message(F.sticker)
 async def handle_sticker(message: Message):
-    me = await bot.get_me()
-    bot_username = me.username
-
-    chat_history = history[message.chat.id]
     sender = message.from_user.full_name if message.from_user else "Хтось"
     sticker = message.sticker
     emoji = sticker.emoji or "🙂"
-
-    mentioned = was_mentioned(message, bot_username)
+    mentioned = was_mentioned(message)
 
     # анімовані (.tgs) і відео-стікери (.webm) Gemini vision напряму не їсть —
     # фіксуємо тільки емодзі, без реального аналізу картинки
     if sticker.is_animated or sticker.is_video:
         if not mentioned:
-            chat_history.append(
-                {"role": "user", "parts": [{"text": f"{sender}: [анімований стікер {emoji}]"}]}
-            )
+            remember_only(message, sender, f"[анімований стікер {emoji}]")
             return
-
-        full_prompt_text = f"{sender}: [надіслав(-ла) анімований стікер {emoji}]"
-        sender_context = get_sender_context(message)
-        if sender_context:
-            full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
-
-        contents = list(chat_history)
-        contents.append({"role": "user", "parts": [{"text": full_prompt_text}]})
-
-        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-        try:
-            answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
-            answer = strip_name_prefix(answer, sender, me.full_name)
-        except Exception:
-            log.exception("AI request failed")
-            answer = "Вибач, сталася помилка при зверненні до AI 😔"
-
-        chat_history.append(
-            {"role": "user", "parts": [{"text": f"{sender}: [анімований стікер {emoji}]"}]}
+        await process_and_reply(
+            message, sender, f"[надіслав(-ла) анімований стікер {emoji}]",
+            history_label=f"[анімований стікер {emoji}]",
         )
-        chat_history.append({"role": "model", "parts": [{"text": answer}]})
-
-        await message.reply(answer)
         return
 
     # звичайний статичний стікер — webp, Gemini vision їсть напряму
     try:
-        sticker_bytes = await download_sticker_bytes(message)
+        file = await bot.get_file(sticker.file_id)
+        buffer = await bot.download_file(file.file_path)
+        sticker_bytes = buffer.read()
     except Exception:
         log.exception("Failed to download sticker")
         if mentioned:
@@ -448,52 +661,15 @@ async def handle_sticker(message: Message):
         return
 
     if not mentioned:
-        # без зайвого запиту до Gemini — просто фіксуємо факт і емодзі в історію
-        chat_history.append(
-            {"role": "user", "parts": [{"text": f"{sender}: [надіслав(-ла) стікер {emoji}]"}]}
-        )
+        remember_only(message, sender, f"[надіслав(-ла) стікер {emoji}]")
         return
 
-    full_prompt_text = f"{sender}: [надіслав(-ла) стікер, емодзі: {emoji}]"
-
-    sender_context = get_sender_context(message)
-    if sender_context:
-        full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
-
-    contents = list(chat_history)
-    contents.append(
-        {
-            "role": "user",
-            "parts": [
-                {"text": full_prompt_text},
-                types.Part.from_bytes(data=sticker_bytes, mime_type="image/webp"),
-            ],
-        }
+    extra_parts = [types.Part.from_bytes(data=sticker_bytes, mime_type="image/webp")]
+    await process_and_reply(
+        message, sender, f"[надіслав(-ла) стікер, емодзі: {emoji}]",
+        extra_parts=extra_parts,
+        history_label=f"[надіслав(-ла) стікер {emoji}]",
     )
-
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    try:
-        answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
-        answer = strip_name_prefix(answer, sender, me.full_name)
-    except Exception:
-        log.exception("AI request failed")
-        answer = "Вибач, сталася помилка при зверненні до AI 😔"
-
-    chat_history.append(
-        {"role": "user", "parts": [{"text": f"{sender}: [надіслав(-ла) стікер {emoji}]"}]}
-    )
-    chat_history.append({"role": "model", "parts": [{"text": answer}]})
-
-    await message.reply(answer)
-
-
-async def download_animation_bytes(message: Message) -> bytes:
-    """Завантажує gif/анімацію (по факту mp4 без звуку)."""
-    animation = message.animation
-    file = await bot.get_file(animation.file_id)
-    buffer = await bot.download_file(file.file_path)
-    return buffer.read()
 
 
 @dp.message(F.animation)
@@ -501,20 +677,15 @@ async def handle_animation(message: Message):
     """GIF в Telegram технічно приходить як mp4 без звуку (F.animation) —
     gemini-3.1-flash-lite підтримує відео на вході, тож кидаємо файл напряму,
     без потреби витягувати кадр через ffmpeg."""
-    me = await bot.get_me()
-    bot_username = me.username
-
-    chat_history = history[message.chat.id]
     sender = message.from_user.full_name if message.from_user else "Хтось"
     caption = message.caption or ""
-
-    mentioned = was_mentioned(message, bot_username)
+    mentioned = was_mentioned(message)
 
     if not mentioned:
-        note = f"{sender}: [надіслав(-ла) гіфку]"
+        note = "[надіслав(-ла) гіфку]"
         if caption:
             note += f" {caption}"
-        chat_history.append({"role": "user", "parts": [{"text": note}]})
+        remember_only(message, sender, note)
         return
 
     animation = message.animation
@@ -523,274 +694,118 @@ async def handle_animation(message: Message):
         return
 
     try:
-        animation_bytes = await download_animation_bytes(message)
+        file = await bot.get_file(animation.file_id)
+        buffer = await bot.download_file(file.file_path)
+        animation_bytes = buffer.read()
     except Exception:
         log.exception("Failed to download animation")
         await message.reply("Не вдалось завантажити гіфку 😔")
         return
 
-    question = strip_trigger(caption, bot_username) or "Що відбувається на цій гіфці?"
-
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    full_prompt_text = f"{sender}: {question}"
-    if needs_web_search(question):
-        web_info = get_web_context(question)
-        if web_info:
-            full_prompt_text += web_info
-
-    sender_context = get_sender_context(message)
-    if sender_context:
-        full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
-
-    contents = list(chat_history)
-    contents.append(
-        {
-            "role": "user",
-            "parts": [
-                {"text": full_prompt_text},
-                types.Part.from_bytes(data=animation_bytes, mime_type="video/mp4"),
-            ],
-        }
+    question = strip_trigger(caption, BOT_USERNAME) or "Що відбувається на цій гіфці?"
+    extra_parts = [types.Part.from_bytes(data=animation_bytes, mime_type="video/mp4")]
+    await process_and_reply(
+        message, sender, question,
+        extra_parts=extra_parts,
+        history_label=f"[гіфка] {question}",
     )
-
-    try:
-        answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
-        answer = strip_name_prefix(answer, sender, me.full_name)
-    except Exception:
-        log.exception("AI request failed")
-        answer = "Вибач, сталася помилка при зверненні до AI 😔"
-
-    chat_history.append(
-        {"role": "user", "parts": [{"text": f"{sender}: [гіфка] {question}"}]}
-    )
-    chat_history.append({"role": "model", "parts": [{"text": answer}]})
-
-    await message.reply(answer)
-
-
-async def download_video_note_bytes(message: Message) -> bytes:
-    """Завантажує відео кружка (mp4 зі звуком)."""
-    video_note = message.video_note
-    file = await bot.get_file(video_note.file_id)
-    buffer = await bot.download_file(file.file_path)
-    return buffer.read()
 
 
 @dp.message(F.video_note)
 async def handle_video_note(message: Message):
     """Кружки (video_note): транскрибуємо мовлення так само, як голосові —
     в історію і у відповідь йде тільки текст транскрипції, без самого відео."""
-    me = await bot.get_me()
-    bot_username = me.username
-
-    chat_history = history[message.chat.id]
     sender = message.from_user.full_name if message.from_user else "Хтось"
-
-    mentioned = was_mentioned(message, bot_username)
+    mentioned = was_mentioned(message)
 
     try:
-        video_note_bytes = await download_video_note_bytes(message)
+        video_note = message.video_note
+        file = await bot.get_file(video_note.file_id)
+        buffer = await bot.download_file(file.file_path)
+        video_note_bytes = buffer.read()
     except Exception:
         log.exception("Failed to download video note")
         if mentioned:
             await message.reply("Не вдалось завантажити кружок 😔")
         return
 
-    transcript_contents = [
-        {
-            "role": "user",
-            "parts": [
-                {
-                    "text": "Транскрибуй мовлення з цього відео дослівно, "
-                    "тією мовою, якою його промовлено. У відповідь дай ТІЛЬКИ "
-                    "текст транскрипції, без жодних коментарів чи лапок."
-                },
-                types.Part.from_bytes(data=video_note_bytes, mime_type="video/mp4"),
-            ],
-        }
-    ]
-
-    try:
-        response = await ai_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=transcript_contents,
-            config=types.GenerateContentConfig(max_output_tokens=400, temperature=0.2),
-        )
-        transcript = (response.text or "").strip()
-    except Exception:
-        log.exception("Video note transcription failed")
-        transcript = ""
+    transcript = await transcribe_media(video_note_bytes, "video/mp4", "video_note")
 
     if not transcript:
         if mentioned:
             await message.reply("Не вдалось розпізнати кружок 😔")
         else:
-            chat_history.append(
-                {"role": "user", "parts": [{"text": f"{sender}: [кружок]"}]}
-            )
+            remember_only(message, sender, "[кружок]")
         return
 
     if not mentioned:
-        chat_history.append(
-            {"role": "user", "parts": [{"text": f"{sender}: [кружок] {transcript}"}]}
-        )
+        remember_only(message, sender, f"[кружок] {transcript}")
         return
 
-    full_prompt_text = f"{sender}: {transcript}"
-
-    if needs_web_search(transcript):
-        web_info = get_web_context(transcript)
-        if web_info:
-            full_prompt_text += web_info
-
-    sender_context = get_sender_context(message)
-    if sender_context:
-        full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
-
-    contents = list(chat_history)
-    contents.append({"role": "user", "parts": [{"text": full_prompt_text}]})
-
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    try:
-        answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
-        answer = strip_name_prefix(answer, sender, me.full_name)
-    except Exception:
-        log.exception("AI request failed")
-        answer = "Вибач, сталася помилка при зверненні до AI 😔"
-
-    chat_history.append(
-        {"role": "user", "parts": [{"text": f"{sender}: [кружок] {transcript}"}]}
+    await process_and_reply(
+        message, sender, transcript,
+        history_label=f"[кружок] {transcript}",
     )
-    chat_history.append({"role": "model", "parts": [{"text": answer}]})
-
-    await message.reply(answer)
-
-
-async def download_voice_bytes(message: Message) -> bytes:
-    """Завантажує аудіо голосового повідомлення (ogg/opus)."""
-    voice = message.voice
-    file = await bot.get_file(voice.file_id)
-    buffer = await bot.download_file(file.file_path)
-    return buffer.read()
 
 
 @dp.message(F.voice)
 async def handle_voice(message: Message):
     """Голосові повідомлення: Gemini сам транскрибує та розуміє аудіо напряму."""
-    me = await bot.get_me()
-    bot_username = me.username
-
-    chat_history = history[message.chat.id]
     sender = message.from_user.full_name if message.from_user else "Хтось"
     caption = message.caption or ""
-
-    mentioned = was_mentioned(message, bot_username)
+    mentioned = was_mentioned(message)
 
     try:
-        voice_bytes = await download_voice_bytes(message)
+        voice = message.voice
+        file = await bot.get_file(voice.file_id)
+        buffer = await bot.download_file(file.file_path)
+        voice_bytes = buffer.read()
     except Exception:
         log.exception("Failed to download voice message")
         if mentioned:
             await message.reply("Не вдалось завантажити голосове 😔")
         return
 
-    # Спочатку просимо Gemini просто транскрибувати аудіо в текст —
-    # це потрібно і для запам'ятовування контексту, і для відповіді.
-    transcript_contents = [
-        {
-            "role": "user",
-            "parts": [
-                {
-                    "text": "Транскрибуй це голосове повідомлення дослівно, "
-                    "тією мовою, якою його промовлено. У відповідь дай ТІЛЬКИ "
-                    "текст транскрипції, без жодних коментарів чи лапок."
-                },
-                types.Part.from_bytes(data=voice_bytes, mime_type="audio/ogg"),
-            ],
-        }
-    ]
-
-    try:
-        response = await ai_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=transcript_contents,
-            config=types.GenerateContentConfig(max_output_tokens=400, temperature=0.2),
-        )
-        transcript = (response.text or "").strip()
-    except Exception:
-        log.exception("Voice transcription failed")
-        transcript = ""
+    transcript = await transcribe_media(voice_bytes, "audio/ogg", "voice")
 
     if not transcript:
         if mentioned:
             await message.reply("Не вдалось розпізнати голосове повідомлення 😔")
         else:
-            chat_history.append(
-                {"role": "user", "parts": [{"text": f"{sender}: [голосове повідомлення]"}]}
-            )
+            remember_only(message, sender, "[голосове повідомлення]")
         return
 
     if not mentioned:
-        note = f"{sender}: [голосове] {transcript}"
+        note = f"[голосове] {transcript}"
         if caption:
             note += f" ({caption})"
-        chat_history.append({"role": "user", "parts": [{"text": note}]})
+        remember_only(message, sender, note)
         return
 
-    question = strip_trigger(caption, bot_username)
-    full_prompt_text = f"{sender}: {transcript}"
+    question = strip_trigger(caption, BOT_USERNAME)
+    question_text = transcript
     if question:
-        full_prompt_text += f"\n[Коментар до голосового]: {question}"
+        question_text += f"\n[Коментар до голосового]: {question}"
 
-    if needs_web_search(transcript):
-        web_info = get_web_context(transcript)
-        if web_info:
-            full_prompt_text += web_info
-
-    sender_context = get_sender_context(message)
-    if sender_context:
-        full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
-
-    contents = list(chat_history)
-    contents.append({"role": "user", "parts": [{"text": full_prompt_text}]})
-
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    try:
-        answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
-        answer = strip_name_prefix(answer, sender, me.full_name)
-    except Exception:
-        log.exception("AI request failed")
-        answer = "Вибач, сталася помилка при зверненні до AI 😔"
-
-    chat_history.append(
-        {"role": "user", "parts": [{"text": f"{sender}: [голосове] {transcript}"}]}
+    await process_and_reply(
+        message, sender, question_text,
+        history_label=f"[голосове] {transcript}",
     )
-    chat_history.append({"role": "model", "parts": [{"text": answer}]})
-
-    await message.reply(answer)
 
 
 @dp.message(F.document)
 async def handle_document(message: Message):
-    me = await bot.get_me()
-    bot_username = me.username
-
-    chat_history = history[message.chat.id]
     sender = message.from_user.full_name if message.from_user else "Хтось"
     caption = message.caption or ""
     doc = message.document
     file_name = doc.file_name or "файл"
-
-    mentioned = was_mentioned(message, bot_username)
+    mentioned = was_mentioned(message)
 
     if not mentioned:
-        note = f"{sender}: [надіслав(-ла) файл {file_name}]"
+        note = f"[надіслав(-ла) файл {file_name}]"
         if caption:
             note += f" {caption}"
-        chat_history.append({"role": "user", "parts": [{"text": note}]})
+        remember_only(message, sender, note)
         return
 
     if doc.file_size and doc.file_size > 20 * 1024 * 1024:
@@ -816,50 +831,54 @@ async def handle_document(message: Message):
         )
         return
 
-    question = strip_trigger(caption, bot_username) or "Опрацюй цей файл і розкажи головне."
+    question = strip_trigger(caption, BOT_USERNAME) or "Опрацюй цей файл і розкажи головне."
+    question_text = f"{question}\n\n[Файл: {file_name}]"
 
-    full_prompt_text = f"{sender}: {question}\n\n[Файл: {file_name}]"
-    if needs_web_search(question):
-        web_info = get_web_context(question)
-        if web_info:
-            full_prompt_text += web_info
-
-    sender_context = get_sender_context(message)
-    if sender_context:
-        full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
-
-    parts = [{"text": full_prompt_text}]
+    extra_parts = None
     if raw_part is not None:
-        parts.append(raw_part)
+        extra_parts = [raw_part]
     else:
         trimmed = text_content[:MAX_DOC_CHARS]
         if len(text_content) > MAX_DOC_CHARS:
             trimmed += "\n...[текст обрізано, файл завеликий]"
-        parts[0]["text"] += f"\n\nВміст файлу:\n{trimmed}"
+        question_text += f"\n\nВміст файлу:\n{trimmed}"
 
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    contents = list(chat_history)
-    contents.append({"role": "user", "parts": parts})
-
-    try:
-        answer = (await ask_gemini(contents)) or "Не зміг сформулювати відповідь 🤔"
-        answer = strip_name_prefix(answer, sender, me.full_name)
-    except Exception:
-        log.exception("AI request failed")
-        answer = "Вибач, сталася помилка при зверненні до AI 😔"
-
-    chat_history.append(
-        {"role": "user", "parts": [{"text": f"{sender}: [файл {file_name}] {question}"}]}
+    await process_and_reply(
+        message, sender, question_text,
+        extra_parts=extra_parts,
+        history_label=f"[файл {file_name}] {question}",
     )
-    chat_history.append({"role": "model", "parts": [{"text": answer}]})
 
-    await message.reply(answer)
+
+def _validate_config() -> None:
+    """Падаємо одразу зі зрозумілим повідомленням, якщо чогось не вистачає
+    в .env — краще явна помилка при старті, ніж незрозумілий збій пізніше."""
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not GEMINI_API_KEY:
+        missing.append("GEMINI_API_KEY")
+    if not GEMINI_MODEL:
+        missing.append("GEMINI_MODEL")
+    if missing:
+        raise RuntimeError(
+            "Не задані обов'язкові змінні оточення: " + ", ".join(missing)
+        )
 
 
 async def main():
+    global BOT_ID, BOT_USERNAME, BOT_FULL_NAME
+
+    _validate_config()
+
     print(f"Поточна модель в боті: {GEMINI_MODEL}")
     log.info("Бот запускається...")
+
+    me = await bot.get_me()
+    BOT_ID = me.id
+    BOT_USERNAME = me.username
+    BOT_FULL_NAME = me.full_name
+    log.info(f"Бот авторизований як @{BOT_USERNAME} (id={BOT_ID})")
 
     # Koyeb (безкоштовний план) вимагає Web Service з відкритим портом —
     # піднімаємо мінімальний HTTP-сервер для health-check поруч з polling'ом.
@@ -877,6 +896,9 @@ async def main():
     site = web.TCPSite(runner, host="0.0.0.0", port=port)
     await site.start()
     log.info(f"Health-check сервер запущено на порту {port}")
+
+    asyncio.create_task(idle_chat_watcher())
+    log.info(f"Спостерігач за тишею в чаті запущено (поріг {IDLE_HOURS}г)")
 
     await dp.start_polling(bot)
 
