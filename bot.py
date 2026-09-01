@@ -17,8 +17,6 @@ from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message, ReactionTypeEmoji
 from aiohttp import web
-from bs4 import BeautifulSoup
-from ddgs import DDGS
 from google import genai
 from google.genai import errors, types
 from pptx import Presentation
@@ -27,6 +25,7 @@ from config import (
     BOT_TOKEN,
     GEMINI_API_KEY,
     GEMINI_MODEL,
+    TAVILY_API_KEY,
     TRIGGER_NAMES,
     SYSTEM_PROMPT,
     HISTORY_SIZE,
@@ -83,6 +82,201 @@ MAX_SEARCH_RESULTS = 5
 MAX_FETCH_CHARS = 6000
 MAX_DOC_CHARS = 40000
 
+# --- Кеш пошукових запитів ------------------------------------------------
+# Якщо кілька людей підряд запитують те саме (наприклад "яка погода?"),
+# не варто бити по зовнішньому API двічі — тримаємо результат кілька
+# хвилин в пам'яті.
+SEARCH_CACHE_TTL_SEC = 5 * 60
+_search_cache: dict[str, tuple[float, str]] = {}
+
+
+def _cache_get(key: str) -> str | None:
+    entry = _search_cache.get(key)
+    if not entry:
+        return None
+    ts, value = entry
+    if time.time() - ts > SEARCH_CACHE_TTL_SEC:
+        _search_cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: str, value: str) -> None:
+    _search_cache[key] = (time.time(), value)
+    # Проста самоочистка, щоб словник не ріс нескінченно в довгоживучому процесі.
+    if len(_search_cache) > 200:
+        oldest_key = min(_search_cache, key=lambda k: _search_cache[k][0])
+        _search_cache.pop(oldest_key, None)
+
+
+# --- Курс валют (НБП — Народний банк Польщі) ------------------------------
+# Бот у Польщі, тож база — PLN. Швидше й точніше за пошук по інтернету для
+# цієї конкретної, дуже частої категорії запитів.
+CURRENCY_TRIGGER_WORDS = {
+    "курс", "курси", "курсы", "долар", "доллар", "євро", "евро",
+    "гривня", "гривны", "гривень", "злотий", "злотых", "злотого", "фунт",
+}
+
+CURRENCY_KEYWORDS = {
+    "USD": ["долар", "доллар", "usd", "$"],
+    "EUR": ["євро", "евро", "eur", "€"],
+    "UAH": ["гривня", "гривны", "гривень", "грн", "uah", "₴"],
+    "GBP": ["фунт", "gbp", "£"],
+}
+
+
+def is_currency_query(text: str) -> bool:
+    text_lower = text.lower()
+    return any(w in text_lower for w in CURRENCY_TRIGGER_WORDS)
+
+
+def detect_currency_codes(text: str) -> list[str]:
+    text_lower = text.lower()
+    found = [code for code, keywords in CURRENCY_KEYWORDS.items()
+             if any(kw in text_lower for kw in keywords)]
+    return found
+
+
+def _currency_sync(codes: list[str]) -> str:
+    codes = codes or ["USD", "EUR"]
+    lines = []
+    for code in codes:
+        try:
+            resp = requests.get(
+                f"https://api.nbp.pl/api/exchangerates/rates/A/{code}/?format=json",
+                timeout=6,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            rate = data["rates"][0]["mid"]
+            date = data["rates"][0]["effectiveDate"]
+            lines.append(f"- 1 {code} = {rate} PLN (курс НБП станом на {date})")
+        except Exception as e:
+            log.error(f"Помилка отримання курсу {code} з НБП: {e}")
+
+    if not lines:
+        return ""
+    return "\n\n[Актуальний курс валют]:\n" + "\n".join(lines)
+
+
+# --- Погода (Open-Meteo) ---------------------------------------------------
+# Безкоштовний API без ключа, точніший і швидший за скрейпінг для цієї
+# категорії запитів.
+WEATHER_TRIGGER_WORDS = {"погода", "погоду", "погоди", "прогноз погоды", "прогноз погоди"}
+DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "Bytom")
+_WEATHER_STOPWORDS = {
+    "сьогодні", "зараз", "завтра", "яка", "буде", "у",
+    "сегодня", "сейчас", "завтра", "какая", "будет",
+}
+
+
+def is_weather_query(text: str) -> bool:
+    text_lower = text.lower()
+    return any(w in text_lower for w in WEATHER_TRIGGER_WORDS)
+
+
+def extract_weather_city(text: str) -> str:
+    """Намагається витягти назву міста після слова 'погода' (напр. 'погода
+    у Варшаві'). Якщо не вдалось — використовує місто за замовчуванням."""
+    match = re.search(
+        r"погод[аиу]?\s*(?:в|у|на)?\s*([A-Za-zА-Яа-яЇїІіЄєҐґ\-]{3,30})",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        candidate = match.group(1).strip()
+        if candidate.lower() not in _WEATHER_STOPWORDS:
+            return candidate
+    return DEFAULT_WEATHER_CITY
+
+
+def _weather_sync(city: str) -> str:
+    try:
+        geo_resp = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": city, "count": 1, "language": "uk"},
+            timeout=6,
+        )
+        geo_resp.raise_for_status()
+        results = geo_resp.json().get("results")
+        if not results:
+            return ""
+        loc = results[0]
+        found_name = loc.get("name", city)
+        country = loc.get("country", "")
+
+        forecast_resp = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": loc["latitude"],
+                "longitude": loc["longitude"],
+                "current": "temperature_2m,apparent_temperature,precipitation,wind_speed_10m",
+                "timezone": "auto",
+            },
+            timeout=6,
+        )
+        forecast_resp.raise_for_status()
+        current = forecast_resp.json().get("current", {})
+        if not current:
+            return ""
+
+        return (
+            f"\n\n[Поточна погода — {found_name}, {country}]:\n"
+            f"Температура: {current.get('temperature_2m')}°C "
+            f"(відчувається як {current.get('apparent_temperature')}°C)\n"
+            f"Вітер: {current.get('wind_speed_10m')} км/год, "
+            f"опади: {current.get('precipitation')} мм"
+        )
+    except Exception as e:
+        log.error(f"Помилка отримання погоди для {city!r}: {e}")
+        return ""
+
+
+# --- Загальний пошук в інтернеті (Tavily) ----------------------------------
+# Tavily заточений під LLM-агентів: одразу повертає очищений релевантний
+# контент по кожному результату (не треба окремо парсити HTML сторінки, як
+# із сирими сніпетами DuckDuckGo).
+def _tavily_search_sync(query: str) -> str:
+    if not TAVILY_API_KEY:
+        log.error("TAVILY_API_KEY не задано в .env — пошук в інтернеті вимкнено")
+        return ""
+
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": MAX_SEARCH_RESULTS,
+                "include_answer": True,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log.error(f"Помилка пошуку Tavily: {e}")
+        return ""
+
+    lines = ["\n\n[Знайдена актуальна інформація з інтернету]:"]
+
+    answer = data.get("answer")
+    if answer:
+        lines.append(f"Коротка відповідь: {answer}")
+
+    for r in data.get("results", []):
+        title = r.get("title", "")
+        content = r.get("content", "")
+        url = r.get("url", "")
+        if len(content) > MAX_FETCH_CHARS:
+            content = content[:MAX_FETCH_CHARS] + "...[текст обрізано]"
+        lines.append(f"- {title}: {content} ({url})")
+
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
+
 # Скільки разів повторити запит до Gemini при тимчасових помилках
 # (мережа/сервер), перш ніж здатися.
 GEMINI_MAX_RETRIES = 2
@@ -134,57 +328,35 @@ def needs_web_search(text: str) -> bool:
     return any(trigger in text_lower for trigger in SEARCH_TRIGGERS)
 
 
-def _web_search_sync(query: str) -> list[dict]:
-    try:
-        results = DDGS().text(query, max_results=MAX_SEARCH_RESULTS)
-        return results or []
-    except Exception as e:
-        log.error(f"Помилка пошуку DuckDuckGo: {e}")
-        return []
-
-
-def _web_fetch_sync(url: str) -> str:
-    try:
-        resp = requests.get(
-            url,
-            timeout=8,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"},
-        )
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
-            tag.decompose()
-        text = " ".join(soup.get_text(separator=" ").split())
-        if len(text) > MAX_FETCH_CHARS:
-            text = text[:MAX_FETCH_CHARS] + "...[текст обрізано]"
-        return text
-    except Exception as e:
-        log.error(f"Помилка завантаження {url}: {e}")
-        return ""
-
-
 async def get_web_context(query: str) -> str:
-    """Робить пошук + підвантажує повний текст топ-результату.
-    Повертає готовий текстовий блок для вставки в промпт Gemini.
-    Синхронні мережеві виклики винесені в окремий тред, щоб не блокувати
-    event loop бота."""
-    results = await asyncio.to_thread(_web_search_sync, query)
-    if not results:
-        return ""
+    """Роутер: спочатку перевіряє кеш, далі — чи це запит про курс валют
+    або погоду (спеціалізовані швидкі й точні джерела), і лише якщо ні —
+    йде в загальний пошук через Tavily. Успішний результат кешується на
+    SEARCH_CACHE_TTL_SEC, щоб однаковий запит від різних людей підряд не
+    бив по зовнішніх API двічі."""
+    cache_key = query.strip().lower()
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        log.info(f"Пошук: кеш-хіт для запиту {query!r}")
+        return cached
 
-    lines = ["\n\n[Знайдена актуальна інформація з інтернету]:"]
-    for r in results:
-        lines.append(f"- {r.get('title', '')}: {r.get('body', '')} ({r.get('href', '')})")
+    result = ""
 
-    top_url = results[0].get("href")
-    if top_url:
-        full_text = await asyncio.to_thread(_web_fetch_sync, top_url)
-        if full_text:
-            lines.append(
-                f"\n[Повний текст першого джерела ({top_url})]:\n{full_text}"
-            )
+    if is_currency_query(query):
+        codes = detect_currency_codes(query)
+        result = await asyncio.to_thread(_currency_sync, codes)
 
-    return "\n".join(lines)
+    elif is_weather_query(query):
+        city = extract_weather_city(query)
+        result = await asyncio.to_thread(_weather_sync, city)
+
+    if not result:
+        result = await asyncio.to_thread(_tavily_search_sync, query)
+
+    if result:
+        _cache_set(cache_key, result)
+
+    return result
 
 
 # chat_id -> deque of {"role": ..., "content": ...}
