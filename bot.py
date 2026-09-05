@@ -1317,17 +1317,14 @@ async def main():
     await site.start()
     log.info(f"Health-check сервер запущено на порту {port}")
 
+    await refresh_current_date()  # синхронний перший фетч ще до старту polling
+    asyncio.create_task(date_sync_watcher())
+    log.info("Синхронізація дати з інтернетом запущена (кожні 8г)")
+
     asyncio.create_task(idle_chat_watcher())
     log.info(f"Спостерігач за тишею в чаті запущено (поріг {IDLE_HOURS}г)")
 
     await dp.start_polling(bot)
-
-    await refresh_current_date()  # синхронний перший фетч ще до старту polling
-    asyncio.create_task(date_sync_watcher())
-    log.info("Синхронізація дати з інтернетом запущена (кожні 12г)")
-
-    asyncio.create_task(idle_chat_watcher())
-    log.info(f"Спостерігач за тишею в чаті запущено (поріг {IDLE_HOURS}г)")
 
 
 if __name__ == "__main__":
