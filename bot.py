@@ -335,6 +335,17 @@ last_human_activity: dict[int, float] = {}
 # chat_id -> чи вже "вистрелили" проактивним повідомленням за цей період тиші
 idle_message_sent: dict[int, bool] = {}
 
+# --- Синхронізація поточної дати з інтернету -----------------------------
+# System time на хостингу зазвичай і так вірний, але тримаємо це окремо
+# від локального часу процесу: якщо хостинг "засне"/зависне на довго
+# (наприклад free-план), процес міг не помітити, що час зсунувся.
+DATE_SYNC_INTERVAL_SEC = 8 * 3600
+
+# Рядок, що підмішується моделі як "сьогоднішня дата" — оновлюється фоновою
+# таскою. Стартове значення — локальний час, щоб бот не був "без дати" до
+# першого успішного запиту.
+current_date_str: str = time.strftime("%Y-%m-%d (%A)")
+
 # --- Реакції на повідомлення без тегу бота -------------------------------
 # Незалежно від того, тегнули бота чи ні, він може іноді (не на кожне
 # повідомлення) поставити емодзі-реакцію, якщо вважає це доречним.
@@ -453,6 +464,8 @@ async def ask_gemini(contents: list) -> str:
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT
+                    + f"\n\n[Сьогоднішня дата: {current_date_str}] — врахуй це, якщо "
+                      "питання стосується часу, віку, дедлайнів, свят чи актуальних подій."
                     + " У переписці повідомлення користувачів позначені як "
                       "'Ім'я: текст' — звертай увагу, хто саме що написав, "
                       "але у своїй відповіді імена дублювати не треба. "
@@ -577,6 +590,38 @@ def get_mentioned_users_context(text: str) -> str:
     if not blocks:
         return ""
     return "\n[Про згаданих людей]:\n" + "\n".join(blocks)
+
+def _fetch_current_date_sync() -> str | None:
+    """Тягне поточну дату з публічного time-API (без ключа). При невдачі
+    повертає None — виклик просто залишить попереднє значення."""
+    try:
+        resp = requests.get(
+            "https://timeapi.io/api/time/current/zone",
+            params={"timeZone": "Europe/Warsaw"},
+            timeout=6,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # приклад: {"year":2026,"month":9,"day":5,"dayOfWeek":"Saturday", ...}
+        return f"{data['year']:04d}-{data['month']:02d}-{data['day']:02d} ({data['dayOfWeek']})"
+    except Exception as e:
+        log.error(f"Не вдалось отримати поточну дату з інтернету: {e}")
+        return None
+
+
+async def refresh_current_date() -> None:
+    global current_date_str
+    fetched = await asyncio.to_thread(_fetch_current_date_sync)
+    if fetched:
+        current_date_str = fetched
+        log.info(f"Поточна дата оновлена: {current_date_str}")
+
+
+async def date_sync_watcher():
+    """Раз на DATE_SYNC_INTERVAL_SEC оновлює current_date_str з інтернету."""
+    while True:
+        await refresh_current_date()
+        await asyncio.sleep(DATE_SYNC_INTERVAL_SEC)
 
 
 def extract_document_text(file_name: str, data: bytes, mime_type: str | None):
@@ -1276,6 +1321,13 @@ async def main():
     log.info(f"Спостерігач за тишею в чаті запущено (поріг {IDLE_HOURS}г)")
 
     await dp.start_polling(bot)
+
+    await refresh_current_date()  # синхронний перший фетч ще до старту polling
+    asyncio.create_task(date_sync_watcher())
+    log.info("Синхронізація дати з інтернетом запущена (кожні 12г)")
+
+    asyncio.create_task(idle_chat_watcher())
+    log.info(f"Спостерігач за тишею в чаті запущено (поріг {IDLE_HOURS}г)")
 
 
 if __name__ == "__main__":
