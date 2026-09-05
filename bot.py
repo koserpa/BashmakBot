@@ -102,6 +102,19 @@ SEARCH_TRIGGERS = {
 }
 
 MAX_SEARCH_RESULTS = 5
+
+IMAGE_SEARCH_TRIGGERS = {
+    "покажи", "покажі", "як виглядає", "як виглядають", "фото", "фотку",
+    "картинка", "картинку", "зображення",
+    "покажи фото", "пришли фото",
+    "как выглядит", "как выглядят", "фотка", "картинка", "изображение",
+}
+
+
+def is_image_query(text: str) -> bool:
+    text_lower = (text or "").lower()
+    return any(t in text_lower for t in IMAGE_SEARCH_TRIGGERS)
+
 MAX_FETCH_CHARS = 6000
 MAX_DOC_CHARS = 40000
 
@@ -259,28 +272,29 @@ def _weather_sync(city: str) -> str:
 # Tavily заточений під LLM-агентів: одразу повертає очищений релевантний
 # контент по кожному результату (не треба окремо парсити HTML сторінки, як
 # із сирими сніпетами DuckDuckGo).
-def _tavily_search_sync(query: str) -> str:
+def _tavily_search_sync(query: str, want_images: bool = False) -> tuple[str, list[str]]:
     if not TAVILY_API_KEY:
         log.error("TAVILY_API_KEY не задано в .env — пошук в інтернеті вимкнено")
-        return ""
+        return "", []
+
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": "basic",
+        "max_results": MAX_SEARCH_RESULTS,
+        "include_answer": True,
+    }
+    if want_images:
+        payload["include_images"] = True
+        payload["include_image_descriptions"] = True
 
     try:
-        resp = requests.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": TAVILY_API_KEY,
-                "query": query,
-                "search_depth": "basic",
-                "max_results": MAX_SEARCH_RESULTS,
-                "include_answer": True,
-            },
-            timeout=10,
-        )
+        resp = requests.post("https://api.tavily.com/search", json=payload, timeout=10)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         log.error(f"Помилка пошуку Tavily: {e}")
-        return ""
+        return "", []
 
     lines = ["\n\n[Знайдена актуальна інформація з інтернету]:"]
 
@@ -296,9 +310,16 @@ def _tavily_search_sync(query: str) -> str:
             content = content[:MAX_FETCH_CHARS] + "...[текст обрізано]"
         lines.append(f"- {title}: {content} ({url})")
 
-    if len(lines) == 1:
-        return ""
-    return "\n".join(lines)
+    text_result = "" if len(lines) == 1 else "\n".join(lines)
+
+    image_urls: list[str] = []
+    for img in data.get("images", [])[:3]:
+        # З include_image_descriptions=True кожен елемент — dict {"url": ..., "description": ...}
+        url = img.get("url") if isinstance(img, dict) else img
+        if url:
+            image_urls.append(url)
+
+    return text_result, image_urls
 
 # Скільки разів повторити запит до Gemini при тимчасових помилках
 # (мережа/сервер), перш ніж здатися.
@@ -362,35 +383,30 @@ def needs_web_search(text: str) -> bool:
     return any(trigger in text_lower for trigger in SEARCH_TRIGGERS)
 
 
-async def get_web_context(query: str) -> str:
-    """Роутер: спочатку перевіряє кеш, далі — чи це запит про курс валют
-    або погоду (спеціалізовані швидкі й точні джерела), і лише якщо ні —
-    йде в загальний пошук через Tavily. Успішний результат кешується на
-    SEARCH_CACHE_TTL_SEC, щоб однаковий запит від різних людей підряд не
-    бив по зовнішніх API двічі."""
+async def get_web_context(query: str) -> tuple[str, list[str]]:
     cache_key = query.strip().lower()
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        log.info(f"Пошук: кеш-хіт для запиту {query!r}")
-        return cached
+    want_images = is_image_query(query)
 
-    result = ""
+    cached = _cache_get(cache_key)
+    if cached is not None and not want_images:
+        log.info(f"Пошук: кеш-хіт для запиту {query!r}")
+        return cached, []
+
+    text_result = ""
+    image_urls: list[str] = []
 
     if is_currency_query(query):
-        codes = detect_currency_codes(query)
-        result = await asyncio.to_thread(_currency_sync, codes)
-
+        text_result = await asyncio.to_thread(_currency_sync, detect_currency_codes(query))
     elif is_weather_query(query):
-        city = extract_weather_city(query)
-        result = await asyncio.to_thread(_weather_sync, city)
+        text_result = await asyncio.to_thread(_weather_sync, extract_weather_city(query))
 
-    if not result:
-        result = await asyncio.to_thread(_tavily_search_sync, query)
+    if not text_result:
+        text_result, image_urls = await asyncio.to_thread(_tavily_search_sync, query, want_images)
 
-    if result:
-        _cache_set(cache_key, result)
+    if text_result and not want_images:
+        _cache_set(cache_key, text_result)
 
-    return result
+    return text_result, image_urls
 
 
 # chat_id -> deque of {"role": ..., "content": ...}
@@ -812,13 +828,12 @@ async def process_and_reply(
     extra_parts: list | None = None,
     history_label: str,
 ) -> None:
-    """Формує повний промпт, звертається до Gemini і відповідає в чат.
-    Викликається тільки коли бот був згаданий (mentioned=True)."""
     chat_history = history[message.chat.id]
 
     full_prompt_text = f"{sender}: {question_text}"
+    image_urls: list[str] = []
     if needs_web_search(question_text):
-        web_info = await get_web_context(question_text)
+        web_info, image_urls = await get_web_context(question_text)
         if web_info:
             full_prompt_text += web_info
 
@@ -852,9 +867,6 @@ async def process_and_reply(
 
     reaction_emoji = parse_reaction_answer(answer)
     if reaction_emoji:
-        # В історію кладемо коротку текстову позначку, а не сирий маркер —
-        # інакше модель побачить "REACTION:🔥" в наступному контексті й
-        # може почати його копіювати як звичайний текст.
         chat_history.append(
             {"role": "model", "parts": [{"text": f"(відреагував {reaction_emoji})"}]}
         )
@@ -871,6 +883,12 @@ async def process_and_reply(
 
     chat_history.append({"role": "model", "parts": [{"text": answer}]})
     await message.reply(answer)
+
+    for url in image_urls:
+        try:
+            await bot.send_photo(message.chat.id, url)
+        except Exception:
+            log.exception(f"Не вдалось надіслати картинку за посиланням {url}")
 
 
 def remember_only(message: Message, sender: str, note: str) -> None:
