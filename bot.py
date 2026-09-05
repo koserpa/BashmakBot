@@ -908,12 +908,6 @@ async def process_and_reply(
     for url in image_urls:
         await _try_send_image_url(message.chat.id, url)
 
-    chat_history.append({"role": "model", "parts": [{"text": answer}]})
-    await message.reply(answer)
-
-    for url in image_urls:
-        await _try_send_image_url(message.chat.id, url)
-
 async def _try_send_image_url(chat_id: int, url: str) -> bool:
     try:
         resp = await asyncio.to_thread(
