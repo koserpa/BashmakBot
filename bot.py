@@ -25,6 +25,7 @@ from config import (
     BOT_TOKEN,
     GEMINI_API_KEY,
     GEMINI_MODEL,
+    GEMINI_RPD_LIMIT,
     TAVILY_API_KEY,
     TRIGGER_NAMES,
     SYSTEM_PROMPT,
@@ -57,6 +58,28 @@ BOT_USERNAME: str = ""
 BOT_FULL_NAME: str = ""
 
 START_TIME = time.time()
+
+
+# --- Лічильник запитів до Gemini (для /model, без походу в логи) ---------
+# Тримається тільки в пам'яті процесу — після рестарту обнуляється, це ок,
+# бо мета лічильника — швидко зорієнтуватись "скільки вже накрутили
+# сьогодні", а не вести точний облік.
+class RequestStats:
+    def __init__(self):
+        self.day = time.strftime("%Y-%m-%d")
+        self.count_today = 0
+        self.count_total = 0
+
+    def record(self):
+        today = time.strftime("%Y-%m-%d")
+        if today != self.day:
+            self.day = today
+            self.count_today = 0
+        self.count_today += 1
+        self.count_total += 1
+
+
+gemini_stats = RequestStats()
 
 # Тригер-слова для автоматичного пошуку в інтернеті. Рішення "шукати чи ні"
 # приймається в коді напряму (детерміновано), а не моделлю через function
@@ -423,6 +446,7 @@ async def ask_gemini(contents: list) -> str:
     last_error: Exception | None = None
 
     for attempt in range(GEMINI_MAX_RETRIES + 1):
+        gemini_stats.record()
         try:
             response = await ai_client.aio.models.generate_content(
                 model=GEMINI_MODEL,
@@ -507,6 +531,7 @@ async def transcribe_media(data: bytes, mime_type: str, kind_label: str) -> str:
             ],
         }
     ]
+    gemini_stats.record()
     try:
         response = await ai_client.aio.models.generate_content(
             model=GEMINI_MODEL,
@@ -697,6 +722,7 @@ async def maybe_react_unprompted(message: Message, sender: str, content_text: st
         + ". Якщо ні — виведи рівно слово NONE. Без пояснень і зайвих символів."
     )
 
+    gemini_stats.record()
     try:
         response = await ai_client.aio.models.generate_content(
             model=GEMINI_MODEL,
@@ -895,6 +921,24 @@ async def cmd_status(message: Message):
         f"Uptime: {hours}г {minutes}хв {seconds}с\n"
         f"Повідомлень в пам'яті цього чату: {chat_len}/{HISTORY_SIZE}"
     )
+
+
+@dp.message(Command("model"))
+async def cmd_model(message: Message):
+    """Швидка діагностика без походу в логи: яка модель зараз використовується
+    і скільки запитів до неї вже пішло сьогодні / з моменту рестарту."""
+    lines = [
+        f"🤖 Модель: <code>{GEMINI_MODEL}</code>",
+        f"📊 Запитів сьогодні: {gemini_stats.count_today}",
+        f"📈 Запитів з моменту останнього рестарту: {gemini_stats.count_total}",
+    ]
+    if GEMINI_RPD_LIMIT:
+        remaining = max(GEMINI_RPD_LIMIT - gemini_stats.count_today, 0)
+        lines.append(f"🎯 Ліміт RPD: {GEMINI_RPD_LIMIT} (залишилось ~{remaining})")
+    else:
+        lines.append("🎯 Ліміт RPD не задано в конфігу (GEMINI_RPD_LIMIT)")
+
+    await message.answer("\n".join(lines))
 
 
 @dp.message(F.text)
