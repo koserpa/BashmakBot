@@ -352,3 +352,17 @@ async def date_sync_watcher():
 
 def get_current_date_str() -> str:
     return current_date_str
+
+
+_WEEKEND_DAY_NAMES = {"saturday", "sunday"}
+
+
+def is_weekend() -> bool:
+    """Чи зараз вихідний (субота/неділя) — за назвою дня тижня, яку тягне
+    timeapi.io разом з датою (напр. '2026-09-05 (Saturday)'). Якщо назву
+    дня розпізнати не вдалось — вважаємо, що НЕ вихідний, щоб через баг
+    парсингу проактивні повідомлення не заблокувались назавжди."""
+    match = re.search(r"\(([A-Za-z]+)\)", current_date_str)
+    if not match:
+        return False
+    return match.group(1).strip().lower() in _WEEKEND_DAY_NAMES

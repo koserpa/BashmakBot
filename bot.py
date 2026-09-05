@@ -77,7 +77,7 @@ async def main():
     dp = Dispatcher()
 
     me = await bot.get_me()
-    bot_state.set_bot_identity(me.id, me.username, me.full_name)
+    bot_state.set_bot_identity(me.id, me.username, me.full_name) # type: ignore
     log.info(f"Бот авторизований як @{me.username} (id={me.id})")
 
     register_handlers(dp, bot)

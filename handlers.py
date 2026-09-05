@@ -36,6 +36,7 @@ from search_utils import (
     get_current_date_str,
     get_web_context,
     is_image_query,
+    is_weekend,
     needs_web_search,
 )
 
@@ -304,13 +305,17 @@ async def send_idle_message(bot: Bot, chat_id: int) -> None:
 async def idle_chat_watcher(bot: Bot):
     """Раз на IDLE_CHECK_INTERVAL_SEC проходиться по відомих чатах: якщо
     тиша довша за IDLE_HOURS і бот ще не писав за цей період тиші —
-    надсилає одне проактивне повідомлення."""
+    надсилає одне проактивне повідомлення. У суботу та неділю проактивні
+    повідомлення вимкнено."""
     idle_hours = float(os.getenv("IDLE_HOURS", "7"))
     idle_check_interval_sec = 15 * 60
 
     while True:
         await asyncio.sleep(idle_check_interval_sec)
         now = time.time()
+
+        if is_weekend():
+            continue  # вихідні — бот сам не пише
 
         for chat_id, last_active in list(bot_state.last_human_activity.items()):
             if bot_state.idle_message_sent.get(chat_id):
@@ -323,7 +328,6 @@ async def idle_chat_watcher(bot: Bot):
                 await send_idle_message(bot, chat_id)
             except Exception:
                 log.exception(f"Не вдалось надіслати проактивне повідомлення в чат {chat_id}")
-
 
 def register_handlers(dp: Dispatcher, bot: Bot) -> None:
     """Реєструє всі хендлери в переданому Dispatcher. Bot передається явно
