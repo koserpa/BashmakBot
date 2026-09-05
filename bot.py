@@ -887,7 +887,7 @@ async def process_and_reply(
         {"role": "user", "parts": [{"text": f"{sender}: {history_label}"}]}
     )
 
-        reaction_emoji = parse_reaction_answer(answer)
+    reaction_emoji = parse_reaction_answer(answer)
     if reaction_emoji:
         chat_history.append(
             {"role": "model", "parts": [{"text": f"(відреагував {reaction_emoji})"}]}
