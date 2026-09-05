@@ -393,16 +393,37 @@ async def get_web_context(query: str) -> tuple[str, list[str]]:
         log.info(f"Пошук: кеш-хіт для запиту {query!r}")
         return cached, []
 
-    text_result = ""
+    parts: list[str] = []
     image_urls: list[str] = []
 
     if is_currency_query(query):
-        text_result = await asyncio.to_thread(_currency_sync, detect_currency_codes(query))
-    elif is_weather_query(query):
-        text_result = await asyncio.to_thread(_weather_sync, extract_weather_city(query))
+        currency_info = await asyncio.to_thread(_currency_sync, detect_currency_codes(query))
+        if currency_info:
+            parts.append(currency_info)
 
-    if not text_result:
-        text_result, image_urls = await asyncio.to_thread(_tavily_search_sync, query, want_images)
+    if is_weather_query(query):
+        weather_info = await asyncio.to_thread(_weather_sync, extract_weather_city(query))
+        if weather_info:
+            parts.append(weather_info)
+
+    # Tavily виконуємо завжди додатково, якщо в запиті є звичайні пошукові
+    # тригери (не тільки курс/погода) — щоб не губити другу частину
+    # змішаного запиту типу "яка погода і хто виграв матч".
+    if needs_web_search(query) and not (is_currency_query(query) or is_weather_query(query)):
+        tavily_text, image_urls = await asyncio.to_thread(_tavily_search_sync, query, want_images)
+        if tavily_text:
+            parts.append(tavily_text)
+    elif is_currency_query(query) or is_weather_query(query):
+        # Якщо запит змішаний (є ще пошукові слова окрім курсу/погоди) —
+        # додатково смикаємо Tavily для решти запиту.
+        remaining_triggers = SEARCH_TRIGGERS - CURRENCY_TRIGGER_WORDS - WEATHER_TRIGGER_WORDS
+        text_lower = query.lower()
+        if any(t in text_lower for t in remaining_triggers):
+            tavily_text, image_urls = await asyncio.to_thread(_tavily_search_sync, query, want_images)
+            if tavily_text:
+                parts.append(tavily_text)
+
+    text_result = "\n".join(parts)
 
     if text_result and not want_images:
         _cache_set(cache_key, text_result)
@@ -866,7 +887,7 @@ async def process_and_reply(
         {"role": "user", "parts": [{"text": f"{sender}: {history_label}"}]}
     )
 
-    reaction_emoji = parse_reaction_answer(answer)
+        reaction_emoji = parse_reaction_answer(answer)
     if reaction_emoji:
         chat_history.append(
             {"role": "model", "parts": [{"text": f"(відреагував {reaction_emoji})"}]}
@@ -880,7 +901,12 @@ async def process_and_reply(
         except Exception:
             log.exception("Не вдалось поставити реакцію, відповідаю текстом")
             await message.reply(reaction_emoji)
-        return
+    else:
+        chat_history.append({"role": "model", "parts": [{"text": answer}]})
+        await message.reply(answer)
+
+    for url in image_urls:
+        await _try_send_image_url(message.chat.id, url)
 
     chat_history.append({"role": "model", "parts": [{"text": answer}]})
     await message.reply(answer)
@@ -1369,6 +1395,61 @@ async def main():
     log.info(f"Спостерігач за тишею в чаті запущено (поріг {IDLE_HOURS}г)")
 
     await dp.start_polling(bot)
+
+def _quota_low() -> bool:
+    """Чи близько до денного ліміту Gemini — якщо так, фонові
+    (не обов'язкові) запити варто пропускати, щоб не з'їсти квоту
+    на реальні відповіді користувачам."""
+    if not GEMINI_RPD_LIMIT:
+        return False
+    return gemini_stats.count_today >= GEMINI_RPD_LIMIT * 0.9  # залишок < 10%
+
+
+async def maybe_react_unprompted(message: Message, sender: str, content_text: str) -> None:
+    if not REACT_UNPROMPTED_ENABLED:
+        return
+    if not content_text or not content_text.strip():
+        return
+    if _quota_low():
+        return
+    if random.random() > REACT_UNPROMPTED_CHANCE:
+        return
+
+    prompt = (
+        f"Повідомлення в чаті від {sender}: \"{content_text}\"\n\n"
+        "Чи варто відреагувати на нього емодзі-реакцією (без тексту)? "
+        "Це доречно ЛИШЕ для дійсно яскравих випадків: дуже смішне, "
+        "шокуюче, влучне, драма, класна новина, бʼючий факап тощо. "
+        "Для нейтральних, буденних чи незрозумілих повідомлень — реакція "
+        "НЕ потрібна, це має бути рідкісна дія, а не звичка. "
+        "Якщо доречно — виведи РІВНО ОДНЕ емодзі з цього списку: "
+        + " ".join(sorted(ALLOWED_REACTIONS))
+        + ". Якщо ні — виведи рівно слово NONE. Без пояснень і зайвих символів."
+    )
+
+    gemini_stats.record()
+    try:
+        response = await ai_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[{"role": "user", "parts": [{"text": prompt}]}],
+            config=types.GenerateContentConfig(max_output_tokens=10, temperature=0.4),
+        )
+        answer = (response.text or "").strip()
+    except Exception:
+        log.exception("Не вдалось перевірити доречність незапитаної реакції")
+        return
+
+    if answer not in ALLOWED_REACTIONS:
+        return
+
+    try:
+        await bot.set_message_reaction(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            reaction=[ReactionTypeEmoji(emoji=answer)],
+        )
+    except Exception:
+        log.exception("Не вдалось поставити незапитану реакцію")
 
 
 if __name__ == "__main__":
