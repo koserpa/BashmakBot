@@ -889,18 +889,20 @@ async def process_and_reply(
         await _try_send_image_url(message.chat.id, url)
 
 async def _try_send_image_url(chat_id: int, url: str) -> bool:
-    """Качає картинку сам і перевіряє, що це валідне зображення, перш ніж
-    слати в Telegram — деякі URL з Tavily/imgflip повертають 404 або
-    HTML-заглушку замість картинки, і send_photo(url) не завжди це ловить."""
     try:
-        resp = await asyncio.to_thread(requests.get, url, timeout=8)
+        resp = await asyncio.to_thread(
+            requests.get,
+            url,
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; BashmakBot/1.0)"},
+        )
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "")
         if not content_type.startswith("image/"):
             log.warning(f"Пропускаю картинку {url}: content-type={content_type!r}")
             return False
         data = resp.content
-        if len(data) < 500:  # надто маленький файл — швидше за все заглушка/помилка
+        if len(data) < 500:
             log.warning(f"Пропускаю картинку {url}: підозріло малий розмір ({len(data)} байт)")
             return False
     except Exception as e:
