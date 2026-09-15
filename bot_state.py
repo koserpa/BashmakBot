@@ -29,6 +29,14 @@ message_activity: dict[int, deque] = defaultdict(lambda: deque(maxlen=40))
 # chat_id -> час останнього drama-втручання бота (кулдаун)
 last_drama_intervention: dict[int, float] = {}
 
+# --- Тиша конкретної людини --------------------------------------------
+# (chat_id, user_id) -> час останнього повідомлення ЦІЄЇ людини в цьому чаті
+last_user_activity: dict[tuple[int, int], float] = {}
+# (chat_id, user_id) -> час останнього підколу про відсутність цієї людини
+last_absence_poke: dict[tuple[int, int], float] = {}
+# chat_id -> {user_id: (username_lower, full_name)} — хто взагалі писав у чаті
+known_chat_users: dict[int, dict] = defaultdict(dict)
+
 def set_bot_identity(bot_id: int, username: str, full_name: str) -> None:
     global BOT_ID, BOT_USERNAME, BOT_FULL_NAME
     BOT_ID = bot_id

@@ -16,6 +16,7 @@ from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message, ReactionTypeEmoji
 from google.genai import types
 import drama_utils
+import absence_utils
 
 import bot_state
 from config import GEMINI_MODEL, GEMINI_RPD_LIMIT, TRIGGER_NAMES, USER_CONTEXT
@@ -151,6 +152,19 @@ def get_full_context_raw(message: Message) -> str:
     username = message.from_user.username.lstrip("@").lower()
     for known_username, ctx in USER_CONTEXT.items():
         if known_username.lower() == username:
+            if isinstance(ctx, dict):
+                parts = [ctx.get("style", "")]
+                if ctx.get("sensitive"):
+                    parts.append(ctx["sensitive"])
+                return " ".join(p for p in parts if p)
+            return ctx
+    return ""
+
+def get_full_context_raw_by_username(username: str) -> str:
+    """Те саме що get_full_context_raw, але за голим username (коли Message
+    людини під рукою немає — напр. для absence-детектора)."""
+    for known_username, ctx in USER_CONTEXT.items():
+        if known_username.lower() == (username or "").lower():
             if isinstance(ctx, dict):
                 parts = [ctx.get("style", "")]
                 if ctx.get("sensitive"):
@@ -302,6 +316,54 @@ async def maybe_intervene_drama(bot: Bot, message: Message) -> None:
         await bot.send_message(chat_id, answer)
     except Exception:
         log.exception(f"Не вдалось надіслати drama-коментар в чат {chat_id}")
+
+async def maybe_poke_absent_user(bot: Bot, message: Message) -> None:
+    """Якщо хтось відомий довго мовчить на фоні активного чату — іноді
+    підколює його відсутність."""
+    chat_id = message.chat.id
+    current_user_id = message.from_user.id if message.from_user else 0
+
+    candidate = absence_utils.find_absent_candidate(chat_id, current_user_id)
+    if not candidate:
+        return
+    if not absence_utils.should_roll_poke():
+        return
+    if quota_low():
+        return
+
+    user_id, full_name, username, silence_hours = candidate
+    absence_utils.mark_poked(chat_id, user_id)  # одразу, щоб не задвоїти
+
+    days = silence_hours / 24
+    style = get_full_context_raw_by_username(username)  # див. нижче
+    prompt = (
+        f"{full_name} не писав(-ла) в чаті вже приблизно {days:.1f} дні. "
+        f"Хтось щойно написав у чаті — на фоні цього встав ОДНЕ коротке "
+        f"речення у своєму стилі, де підколюєш відсутність {full_name} "
+        f"(наприклад, як в стилі 'де {full_name.split()[0]}?'), спираючись "
+        f"на його профіль нижче, якщо доречно. Без пояснень, що ти бот.\n"
+        f"[Про {full_name}]: {style}"
+    )
+
+    contents = list(bot_state.history[chat_id])[-10:] + [
+        {"role": "user", "parts": [{"text": prompt}]}
+    ]
+
+    try:
+        answer = await ask_gemini(contents, get_current_date_str())
+    except Exception:
+        log.exception("Не вдалось згенерувати absence-підкол")
+        return
+
+    if not answer or parse_reaction_answer(answer):
+        return
+
+    answer = strip_name_prefix(answer, "", bot_state.BOT_FULL_NAME)
+    bot_state.history[chat_id].append({"role": "model", "parts": [{"text": answer}]})
+    try:
+        await bot.send_message(chat_id, answer)
+    except Exception:
+        log.exception(f"Не вдалось надіслати absence-підкол в чат {chat_id}")
 
 
 def remember_only(bot: Bot, message: Message, sender: str, note: str) -> None:
@@ -458,15 +520,21 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
     @dp.message.outer_middleware()
     async def track_activity_middleware(handler, message: Message, data: dict):
         """Фіксує будь-яке повідомлення від людини в чаті + живить
-        детектор 'срачу'."""
+        детектори 'срачу' та 'довгої тиші конкретної людини'."""
         if message.chat.type != "private":
             bot_state.last_human_activity[message.chat.id] = time.time()
             bot_state.idle_message_sent[message.chat.id] = False
 
             user_id = message.from_user.id if message.from_user else 0
+            username = message.from_user.username if message.from_user else ""
+            full_name = message.from_user.full_name if message.from_user else ""
             text = message.text or message.caption or ""
+
             drama_utils.record_message(message.chat.id, user_id, text)
+            absence_utils.record_activity(message.chat.id, user_id, username, full_name)
+
             asyncio.create_task(maybe_intervene_drama(bot, message))
+            asyncio.create_task(maybe_poke_absent_user(bot, message))
 
         return await handler(message, data)
 
