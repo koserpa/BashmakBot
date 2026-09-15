@@ -119,6 +119,20 @@ def get_sender_context(message: Message) -> str:
             return ctx  # backward-compat for plain-string entries
     return ""
 
+def get_full_context_raw(message: Message) -> str:
+    """Повний контекст (style + sensitive) без обмежень — для приколів типу /gadalka."""
+    if not message.from_user or not message.from_user.username:
+        return ""
+    username = message.from_user.username.lstrip("@").lower()
+    for known_username, ctx in USER_CONTEXT.items():
+        if known_username.lower() == username:
+            if isinstance(ctx, dict):
+                parts = [ctx.get("style", "")]
+                if ctx.get("sensitive"):
+                    parts.append(ctx["sensitive"])
+                return " ".join(p for p in parts if p)
+            return ctx
+    return ""
 
 def get_mentioned_users_context(text: str) -> str:
     """Шукає в тексті @згадки відомих учасників (окрім самого бота) і
@@ -356,20 +370,27 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             bot_state.idle_message_sent[message.chat.id] = False
         return await handler(message, data)
 
-    @dp.message(Command("start", "help")), IsAdmin())
+    @dp.message(Command("start", "help"), IsAdmin())
     async def cmd_start(message: Message):
         await message.answer(
-            "Привіт! Я бот-асистент. Я запам'ятовую переписку в чаті, "
-            "а відповідаю, коли мене тегнуть (@бот) або звертаються по імені "
-            f"({', '.join(TRIGGER_NAMES)})."
+            "Прівєт, Я Башмак. "
+            f"({', '.join(TRIGGER_NAMES)}).\n\n"
+            "Для обичних смертних:\n"
+            "/help — цей список команд\n"
+            "/gadalka — робе прогноз на основі історії чата і контекста\n"
+            "Тільки для адміна:\n"
+            "/reset — очистити пам'ять поточного чату\n"
+            "/status — статус бота (uptime, розмір історії)\n"
+            "/model — інфо про модель та ліміти запитів"
         )
+            
 
     @dp.message(Command("reset")), IsAdmin())
     async def cmd_reset(message: Message):
         bot_state.history[message.chat.id].clear()
         await message.answer("Пам'ять цього чату очищена 🧹")
 
-    @dp.message(Command("status")), IsAdmin())
+    @dp.message(Command("status"))
     async def cmd_status(message: Message):
         from config import HISTORY_SIZE
 
@@ -399,6 +420,26 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             lines.append("🎯 Ліміт RPD не задано в конфігу (GEMINI_RPD_LIMIT)")
 
         await message.answer("\n".join(lines))
+
+    @dp.message(Command("gadalka"))
+    async def cmd_gadalka(message: Message):
+        sender = message.from_user.full_name if message.from_user else "Хтось"
+        full_context = get_full_context_raw(message)  # <-- тут, без фільтра
+        recent = list(bot_state.history[message.chat.id])[-10:]
+
+        prompt = (
+            f"Ти містична гадалка. Зроби коротке (1-2 речення) абсурдно-влучне "
+            f"'передбачення дня' для {sender}, обов'язково зачепивши щось "
+            f"конкретне з профілю (включно з чутливим/особистим) чи недавньої "
+            f"розмови — саме в цьому й прикол.\n"
+            f"[Про людину]: {full_context}\n"
+            f"[Недавні повідомлення]: {recent}"
+        )
+        answer = await ask_gemini(
+            [{"role": "user", "parts": [{"text": prompt}]}],
+            get_current_date_str(),
+        )
+        await message.reply(f"🔮 {answer}")
 
     @dp.message(Command("start", "help", "reset", "status", "model"))
     async def cmd_denied(message: Message):
