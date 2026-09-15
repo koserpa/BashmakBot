@@ -20,6 +20,10 @@ TRIGGER_NAMES = [n.strip() for n in os.getenv(
  
 HISTORY_SIZE = int(os.getenv("HISTORY_SIZE", ""))
 
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+TTS_VOICE_NAME = os.getenv("TTS_VOICE_NAME", "Kore")
+VOICE_REPLY_ENABLED = os.getenv("VOICE_REPLY_ENABLED", "true").lower() == "true"
+
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "koserpa").lstrip("@").lower()
 
 USER_CONTEXT = {

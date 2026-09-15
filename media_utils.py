@@ -4,6 +4,7 @@
 import io
 import logging
 from pathlib import Path
+import asyncio
 
 import docx
 import openpyxl
@@ -15,6 +16,31 @@ from pptx import Presentation
 log = logging.getLogger("Bashma4ek_Bot.media")
 
 MAX_DOC_CHARS = 40000
+
+async def wav_to_ogg_voice(wav_bytes: bytes) -> bytes | None:
+    """Конвертує WAV у OGG/OPUS через ffmpeg, щоб Telegram показав відповідь
+    як справжнє кругле голосове, а не файл-аудіо. Якщо ffmpeg відсутній на
+    хості — повертає None, і хендлер підстрахується звичайним аудіофайлом."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "wav", "-i", "-",
+            "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "-",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate(input=wav_bytes)
+        if process.returncode != 0 or not stdout:
+            log.warning(f"ffmpeg не зміг сконвертувати аудіо: {stderr.decode(errors='ignore')[:300]}")
+            return None
+        return stdout
+    except FileNotFoundError:
+        log.info("ffmpeg не знайдено — голосова відповідь піде як звичайний аудіофайл")
+        return None
+    except Exception:
+        log.exception("Помилка при конвертації WAV → OGG")
+        return None
 
 
 async def download_telegram_file(bot: Bot, file_id: str) -> bytes | None:

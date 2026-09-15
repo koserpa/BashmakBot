@@ -2,6 +2,10 @@
 транскрибування медіа, лічильник запитів, парсинг маркера REACTION."""
 import logging
 import time
+import io
+import wave
+
+from config import GEMINI_TTS_MODEL, TTS_VOICE_NAME  # додати до існуючого імпорту з config
 
 from google import genai
 from google.genai import errors, types
@@ -161,6 +165,38 @@ async def ask_gemini(contents: list, current_date_str: str) -> str:
 
     log.error(f"ask_gemini: усі спроби вичерпано, остання помилка: {last_error}")
     return "Не вдалося сформулювати відповідь 😔"
+
+async def synthesize_speech(text: str) -> bytes | None:
+    """Озвучує текст через Gemini TTS. Повертає WAV-байти (24kHz/16-bit/mono)
+    або None при помилці — викликається фоново, тож ніколи не валить основний
+    flow."""
+    try:
+        response = await ai_client.aio.models.generate_content(
+            model=GEMINI_TTS_MODEL,
+            contents=text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=TTS_VOICE_NAME
+                        )
+                    )
+                ),
+            ),
+        )
+        pcm = response.candidates[0].content.parts[0].inline_data.data
+    except Exception:
+        log.exception("Не вдалось згенерувати озвучку відповіді")
+        return None
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(pcm)
+    return buffer.getvalue()
 
 
 async def transcribe_media(data: bytes, mime_type: str, kind_label: str) -> str:

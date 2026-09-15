@@ -41,6 +41,15 @@ from search_utils import (
 )
 from aiogram.filters import BaseFilter
 from config import ADMIN_USERNAME
+from config import GEMINI_MODEL, GEMINI_RPD_LIMIT, TRIGGER_NAMES, USER_CONTEXT, VOICE_REPLY_ENABLED
+from gemini_client import (
+    ask_gemini, check_reaction_worthy, gemini_stats,
+    parse_reaction_answer, quota_low, synthesize_speech, transcribe_media,
+)
+from media_utils import (
+    build_reply_media_context, download_telegram_file,
+    extract_document_text, trim_document_text, wav_to_ogg_voice,
+)
 
 class IsAdmin(BaseFilter):
     async def __call__(self, message: Message) -> bool:
@@ -156,6 +165,21 @@ def get_mentioned_users_context(text: str) -> str:
         return ""
     return "\n[Про згаданих людей]:\n" + "\n".join(blocks)
 
+async def _send_voice_reply(bot: Bot, chat_id: int, text: str) -> None:
+    if quota_low():
+        return
+    wav_bytes = await synthesize_speech(text)
+    if not wav_bytes:
+        return
+    ogg_bytes = await wav_to_ogg_voice(wav_bytes)
+    try:
+        if ogg_bytes:
+            await bot.send_voice(chat_id, BufferedInputFile(ogg_bytes, filename="voice.ogg"))
+        else:
+            await bot.send_audio(chat_id, BufferedInputFile(wav_bytes, filename="voice.wav"))
+    except Exception:
+        log.exception("Не вдалось надіслати голосову відповідь")
+
 
 async def _try_send_image_url(bot: Bot, chat_id: int, url: str) -> bool:
     """Качає картинку сама і перевіряє, що це валідне зображення, перш ніж
@@ -227,13 +251,9 @@ def remember_only(bot: Bot, message: Message, sender: str, note: str) -> None:
 
 
 async def process_and_reply(
-    bot: Bot,
-    message: Message,
-    sender: str,
-    question_text: str,
-    *,
-    extra_parts: list | None = None,
-    history_label: str,
+    bot: Bot, message: Message, sender: str, question_text: str, *,
+    extra_parts: list | None = None, history_label: str,
+    also_voice_reply: bool = False,   # ← нове
 ) -> None:
     chat_history = bot_state.history[message.chat.id]
 
@@ -255,6 +275,12 @@ async def process_and_reply(
     parts = [{"text": full_prompt_text}]
     if extra_parts:
         parts.extend(extra_parts)
+
+    else:
+        chat_history.append({"role": "model", "parts": [{"text": answer}]})
+        await message.reply(answer)
+        if also_voice_reply:
+            asyncio.create_task(_send_voice_reply(bot, message.chat.id, answer))
 
     contents = list(chat_history)
     contents.append({"role": "user", "parts": parts})
@@ -628,6 +654,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         await process_and_reply(
             bot, message, sender, question_text,
             history_label=f"[голосове] {transcript}",
+            also_voice_reply=VOICE_REPLY_ENABLED,
         )
 
     @dp.message(F.document)
