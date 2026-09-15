@@ -385,7 +385,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         )
             
 
-    @dp.message(Command("reset")), IsAdmin())
+    @dp.message(Command("reset"), IsAdmin())
     async def cmd_reset(message: Message):
         bot_state.history[message.chat.id].clear()
         await message.answer("Пам'ять цього чату очищена 🧹")
