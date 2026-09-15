@@ -291,12 +291,6 @@ async def process_and_reply(
     if extra_parts:
         parts.extend(extra_parts)
 
-    else:
-        chat_history.append({"role": "model", "parts": [{"text": answer}]})
-        await message.reply(answer)
-        if also_voice_reply:
-            asyncio.create_task(_send_voice_reply(bot, message.chat.id, answer))
-
     contents = list(chat_history)
     contents.append({"role": "user", "parts": parts})
 
