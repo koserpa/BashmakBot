@@ -180,20 +180,30 @@ def get_mentioned_users_context(text: str) -> str:
         return ""
     return "\n[Про згаданих людей]:\n" + "\n".join(blocks)
 
-async def _send_voice_reply(bot: Bot, chat_id: int, text: str) -> None:
+async def _send_voice_reply(bot: Bot, chat_id: int, text: str, reply_to_message_id: int) -> bool:
+    """Повертає True, якщо голосове реально пішло — щоб виклик міг
+    вирішити, чи потрібен ще й текстовий фолбек."""
     if quota_low():
-        return
+        return False
     wav_bytes = await synthesize_speech(text)
     if not wav_bytes:
-        return
+        return False
     ogg_bytes = await wav_to_ogg_voice(wav_bytes)
     try:
         if ogg_bytes:
-            await bot.send_voice(chat_id, BufferedInputFile(ogg_bytes, filename="voice.ogg"))
+            await bot.send_voice(
+                chat_id, BufferedInputFile(ogg_bytes, filename="voice.ogg"),
+                reply_to_message_id=reply_to_message_id,
+            )
         else:
-            await bot.send_audio(chat_id, BufferedInputFile(wav_bytes, filename="voice.wav"))
+            await bot.send_audio(
+                chat_id, BufferedInputFile(wav_bytes, filename="voice.wav"),
+                reply_to_message_id=reply_to_message_id,
+            )
+        return True
     except Exception:
         log.exception("Не вдалось надіслати голосову відповідь")
+        return False
 
 
 async def _try_send_image_url(bot: Bot, chat_id: int, url: str) -> bool:
@@ -331,9 +341,11 @@ async def process_and_reply(
             await message.reply(reaction_emoji)
     else:
         chat_history.append({"role": "model", "parts": [{"text": answer}]})
-        await message.reply(answer)
+        voice_sent = False
         if should_send_voice:
-            asyncio.create_task(_send_voice_reply(bot, message.chat.id, answer))
+            voice_sent = await _send_voice_reply(bot, message.chat.id, answer, message.message_id)
+        if not voice_sent:
+            await message.reply(answer)
 
     for url in image_urls:
         await _try_send_image_url(bot, message.chat.id, url)
