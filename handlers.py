@@ -39,6 +39,13 @@ from search_utils import (
     is_weekend,
     needs_web_search,
 )
+from aiogram.filters import BaseFilter
+from config import ADMIN_USERNAME
+
+class IsAdmin(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        username = (message.from_user.username or "").lstrip("@").lower() if message.from_user else ""
+        return username == ADMIN_USERNAME
 
 log = logging.getLogger("Bashma4ek_Bot.handlers")
 
@@ -96,13 +103,20 @@ def was_mentioned(message: Message) -> bool:
 
 
 def get_sender_context(message: Message) -> str:
-    """Повертає підказку боту про відправника, якщо це відомий учасник."""
     if not message.from_user or not message.from_user.username:
         return ""
     username = message.from_user.username.lstrip("@").lower()
-    for known_username, context in USER_CONTEXT.items():
+    for known_username, ctx in USER_CONTEXT.items():
         if known_username.lower() == username:
-            return context
+            if isinstance(ctx, dict):
+                text = ctx.get("style", "")
+                if ctx.get("sensitive"):
+                    text += (
+                        f"\n[Чутливе, НЕ піднімай як тему; використовуй лише "
+                        f"якщо людина сама зачепить це: {ctx['sensitive']}]"
+                    )
+                return text
+            return ctx  # backward-compat for plain-string entries
     return ""
 
 
@@ -342,7 +356,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             bot_state.idle_message_sent[message.chat.id] = False
         return await handler(message, data)
 
-    @dp.message(Command("start", "help"))
+    @dp.message(Command("start", "help")), IsAdmin())
     async def cmd_start(message: Message):
         await message.answer(
             "Привіт! Я бот-асистент. Я запам'ятовую переписку в чаті, "
@@ -350,12 +364,12 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             f"({', '.join(TRIGGER_NAMES)})."
         )
 
-    @dp.message(Command("reset"))
+    @dp.message(Command("reset")), IsAdmin())
     async def cmd_reset(message: Message):
         bot_state.history[message.chat.id].clear()
         await message.answer("Пам'ять цього чату очищена 🧹")
 
-    @dp.message(Command("status"))
+    @dp.message(Command("status")), IsAdmin())
     async def cmd_status(message: Message):
         from config import HISTORY_SIZE
 
@@ -371,7 +385,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             f"Повідомлень в пам'яті цього чату: {chat_len}/{HISTORY_SIZE}"
         )
 
-    @dp.message(Command("model"))
+    @dp.message(Command("model")), IsAdmin())
     async def cmd_model(message: Message):
         lines = [
             f"🤖 Модель: <code>{GEMINI_MODEL}</code>",
@@ -385,6 +399,10 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             lines.append("🎯 Ліміт RPD не задано в конфігу (GEMINI_RPD_LIMIT)")
 
         await message.answer("\n".join(lines))
+
+    @dp.message(Command("start", "help", "reset", "status", "model"))
+    async def cmd_denied(message: Message):
+        return  # мовчки ігноруємо чужі спроби викликати адмін-команди
 
     @dp.message(F.text)
     async def handle_message(message: Message):
