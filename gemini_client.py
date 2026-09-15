@@ -11,6 +11,7 @@ from google import genai
 from google.genai import errors, types
 
 from config import GEMINI_API_KEY, GEMINI_MODEL, GEMINI_RPD_LIMIT, SYSTEM_PROMPT
+from config import GEMINI_API_KEY, GEMINI_MODEL, GEMINI_RPD_LIMIT, SYSTEM_PROMPT, TTS_RPD_LIMIT
 
 log = logging.getLogger("Bashma4ek_Bot.gemini")
 
@@ -24,6 +25,7 @@ GEMINI_RETRY_DELAY = 2.0
 # Маркер, яким модель може позначити "хочу відповісти реакцією, а не
 # текстом".
 REACTION_PREFIX = "REACTION:"
+VOICE_PREFIX = "VOICE:"
 
 # Емодзі-реакції, дозволені Telegram Bot API для звичайних (не преміум)
 # ботів. Список неповний, але покриває базові емоції.
@@ -56,7 +58,13 @@ class RequestStats:
 
 
 gemini_stats = RequestStats()
+tts_stats = RequestStats()
 
+
+def tts_quota_low() -> bool:
+    """TTS має набагато жорсткіший ліміт, ніж текст (одиниці запитів на
+    добу) — перевіряємо окремо, щоб не спамити 429 в логи."""
+    return tts_stats.count_today >= TTS_RPD_LIMIT
 
 def quota_low() -> bool:
     """Чи близько до денного ліміту Gemini — якщо так, фонові
@@ -79,6 +87,13 @@ def parse_reaction_answer(answer: str) -> str | None:
     log.warning(f"Модель попросила недозволену реакцію: {emoji!r}, ігнорую маркер")
     return None
 
+def parse_voice_marker(answer: str) -> tuple[bool, str]:
+    """Перевіряє, чи модель попросила озвучити відповідь через маркер
+    VOICE: на початку. Повертає (чи_треба_голос, текст_без_маркера)."""
+    stripped = answer.strip()
+    if stripped.startswith(VOICE_PREFIX):
+        return True, stripped[len(VOICE_PREFIX):].strip()
+    return False, answer
 
 def _build_system_instruction(current_date_str: str) -> str:
     return (
@@ -115,6 +130,16 @@ def _build_system_instruction(current_date_str: str) -> str:
           "фото/в файлі і в якому режимі тону зараз розмова. "
           "Опис вмісту — лише якщо він реально потрібен для "
           "відповіді, а не сама мета відповіді."
+        + "\n\nОКРЕМО про голос: якщо тобі написали голосовим "
+          "повідомленням — відповідь ЗАЗВИЧАЙ і так прийде голосом "
+          "автоматично (це вирішує код, не ти). Маркер VOICE: "
+          "використовуй ЛИШЕ для інших типів повідомлень (текст, фото "
+          "тощо), і лише коли голос реально додає цінності: потрібна "
+          "інтонація/емоція, жарт що краще заходить голосом, пісня, "
+          "передражнювання когось. Це ДУЖЕ обмежений ресурс (кілька "
+          "разів на добу на весь чат) — став маркер рідко, як виключення. "
+          f"Якщо вирішив озвучити — виведи '{VOICE_PREFIX}' РІВНО на "
+          "початку відповіді, а після нього — звичайний текст."
     )
 
 
@@ -167,9 +192,11 @@ async def ask_gemini(contents: list, current_date_str: str) -> str:
     return "Не вдалося сформулювати відповідь 😔"
 
 async def synthesize_speech(text: str) -> bytes | None:
-    """Озвучує текст через Gemini TTS. Повертає WAV-байти (24kHz/16-bit/mono)
-    або None при помилці — викликається фоново, тож ніколи не валить основний
-    flow."""
+    if tts_quota_low():
+        log.info("TTS-квота на сьогодні вичерпана — пропускаю озвучку")
+        return None
+    tts_stats.record()
+
     try:
         response = await ai_client.aio.models.generate_content(
             model=GEMINI_TTS_MODEL,

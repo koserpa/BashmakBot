@@ -50,6 +50,11 @@ from media_utils import (
     build_reply_media_context, download_telegram_file,
     extract_document_text, trim_document_text, wav_to_ogg_voice,
 )
+from gemini_client import (
+    ask_gemini, check_reaction_worthy, gemini_stats,
+    parse_reaction_answer, parse_voice_marker, quota_low, synthesize_speech,
+    transcribe_media, tts_quota_low,
+)
 
 class IsAdmin(BaseFilter):
     async def __call__(self, message: Message) -> bool:
@@ -65,6 +70,16 @@ REACT_UNPROMPTED_ENABLED = os.getenv("REACT_UNPROMPTED_ENABLED", "true").lower()
 REACT_UNPROMPTED_CHANCE = float(os.getenv("REACT_UNPROMPTED_CHANCE", "0.35"))
 
 IMAGE_MIME_JPEG = "image/jpeg"
+
+FORCE_VOICE_TRIGGERS = {
+    "голосом", "войсом", "озвуч", "начитай", "проговори",
+    "скинь войс", "скажи вголос",
+}
+
+
+def wants_forced_voice(text: str) -> bool:
+    text_lower = (text or "").lower()
+    return any(t in text_lower for t in FORCE_VOICE_TRIGGERS)
 
 _NAMES_ALT = "|".join(re.escape(n) for n in TRIGGER_NAMES)
 NAME_PATTERN = re.compile(
@@ -253,7 +268,7 @@ def remember_only(bot: Bot, message: Message, sender: str, note: str) -> None:
 async def process_and_reply(
     bot: Bot, message: Message, sender: str, question_text: str, *,
     extra_parts: list | None = None, history_label: str,
-    also_voice_reply: bool = False,   # ← нове
+    is_voice_input: bool = False,   # ← було also_voice_reply
 ) -> None:
     chat_history = bot_state.history[message.chat.id]
 
@@ -294,12 +309,17 @@ async def process_and_reply(
         log.exception("AI request failed")
         answer = "Вибач, сталася помилка при зверненні до AI 😔"
 
+    model_wants_voice, answer = parse_voice_marker(answer)
+    force_voice = wants_forced_voice(question_text)
+    should_send_voice = (
+        (is_voice_input or model_wants_voice or force_voice)
+        and not tts_quota_low()
+    )
+
     chat_history.append(
         {"role": "user", "parts": [{"text": f"{sender}: {history_label}"}]}
     )
 
-    # Якщо вже знайдені картинки для відповіді — ігноруємо маркер REACTION,
-    # інакше модель могла б поставити емодзі й "з'їсти" знайдені картинки.
     reaction_emoji = parse_reaction_answer(answer) if not image_urls else None
 
     if reaction_emoji:
@@ -318,6 +338,8 @@ async def process_and_reply(
     else:
         chat_history.append({"role": "model", "parts": [{"text": answer}]})
         await message.reply(answer)
+        if should_send_voice:
+            asyncio.create_task(_send_voice_reply(bot, message.chat.id, answer))
 
     for url in image_urls:
         await _try_send_image_url(bot, message.chat.id, url)
@@ -654,7 +676,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         await process_and_reply(
             bot, message, sender, question_text,
             history_label=f"[голосове] {transcript}",
-            also_voice_reply=VOICE_REPLY_ENABLED,
+            is_voice_input=VOICE_REPLY_ENABLED,
         )
 
     @dp.message(F.document)
