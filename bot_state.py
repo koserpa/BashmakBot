@@ -23,6 +23,11 @@ last_human_activity: dict[int, float] = {}
 # chat_id -> чи вже "вистрелили" проактивним повідомленням за цей період тиші
 idle_message_sent: dict[int, bool] = {}
 
+# --- Детектор "срачу" -------------------------------------------------------
+# chat_id -> deque of (timestamp, user_id, tension_score) для rate-детекції
+message_activity: dict[int, deque] = defaultdict(lambda: deque(maxlen=40))
+# chat_id -> час останнього drama-втручання бота (кулдаун)
+last_drama_intervention: dict[int, float] = {}
 
 def set_bot_identity(bot_id: int, username: str, full_name: str) -> None:
     global BOT_ID, BOT_USERNAME, BOT_FULL_NAME

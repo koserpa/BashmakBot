@@ -15,6 +15,7 @@ from aiogram.enums import ChatAction
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, Message, ReactionTypeEmoji
 from google.genai import types
+import drama_utils
 
 import bot_state
 from config import GEMINI_MODEL, GEMINI_RPD_LIMIT, TRIGGER_NAMES, USER_CONTEXT
@@ -264,6 +265,44 @@ async def maybe_react_unprompted(bot: Bot, message: Message, sender: str, conten
     except Exception:
         log.exception("Не вдалось поставити незапитану реакцію")
 
+async def maybe_intervene_drama(bot: Bot, message: Message) -> None:
+    """Якщо детектор побачив 'срач' у чаті — генерує одне коротке
+    втручання в стилі бота (не модераторський тон)."""
+    chat_id = message.chat.id
+    if not drama_utils.is_drama_happening(chat_id):
+        return
+    if quota_low():
+        return
+
+    drama_utils.mark_drama_handled(chat_id)  # одразу, щоб не задвоїти
+
+    recent_history = list(bot_state.history[chat_id])[-12:]
+    prompt = (
+        "У чаті зараз накал — люди сваряться/зʼясовують стосунки. "
+        "Встрянь ОДНИМ коротким реченням у своєму звичному стилі: або "
+        "розряди обстановку жартом, або підколи всіх одразу, не вибираючи "
+        "сторону. НЕ повчай і не проси прямим текстом типу 'заспокойтесь' "
+        "— має звучати як природна репліка живої людини в чаті, а не "
+        "модератора."
+    )
+    contents = recent_history + [{"role": "user", "parts": [{"text": prompt}]}]
+
+    try:
+        answer = await ask_gemini(contents, get_current_date_str())
+    except Exception:
+        log.exception("Не вдалось згенерувати drama-коментар")
+        return
+
+    if not answer or parse_reaction_answer(answer):
+        return
+
+    answer = strip_name_prefix(answer, "", bot_state.BOT_FULL_NAME)
+    bot_state.history[chat_id].append({"role": "model", "parts": [{"text": answer}]})
+    try:
+        await bot.send_message(chat_id, answer)
+    except Exception:
+        log.exception(f"Не вдалось надіслати drama-коментар в чат {chat_id}")
+
 
 def remember_only(bot: Bot, message: Message, sender: str, note: str) -> None:
     """Записує подію в історію чату без звернення до Gemini (коли бота не
@@ -418,10 +457,17 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
 
     @dp.message.outer_middleware()
     async def track_activity_middleware(handler, message: Message, data: dict):
-        """Фіксує будь-яке повідомлення від людини в чаті."""
+        """Фіксує будь-яке повідомлення від людини в чаті + живить
+        детектор 'срачу'."""
         if message.chat.type != "private":
             bot_state.last_human_activity[message.chat.id] = time.time()
             bot_state.idle_message_sent[message.chat.id] = False
+
+            user_id = message.from_user.id if message.from_user else 0
+            text = message.text or message.caption or ""
+            drama_utils.record_message(message.chat.id, user_id, text)
+            asyncio.create_task(maybe_intervene_drama(bot, message))
+
         return await handler(message, data)
 
     @dp.message(Command("start", "help"))
