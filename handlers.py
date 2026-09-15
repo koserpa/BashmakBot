@@ -370,7 +370,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             bot_state.idle_message_sent[message.chat.id] = False
         return await handler(message, data)
 
-    @dp.message(Command("start", "help"), IsAdmin())
+    @dp.message(Command("start", "help"))
     async def cmd_start(message: Message):
         await message.answer(
             "Прівєт, Я Башмак. "
@@ -390,7 +390,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         bot_state.history[message.chat.id].clear()
         await message.answer("Пам'ять цього чату очищена 🧹")
 
-    @dp.message(Command("status"))
+    @dp.message(Command("status"), IsAdmin())
     async def cmd_status(message: Message):
         from config import HISTORY_SIZE
 
@@ -406,7 +406,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             f"Повідомлень в пам'яті цього чату: {chat_len}/{HISTORY_SIZE}"
         )
 
-    @dp.message(Command("model")), IsAdmin())
+    @dp.message(Command("model"), IsAdmin())
     async def cmd_model(message: Message):
         lines = [
             f"🤖 Модель: <code>{GEMINI_MODEL}</code>",
