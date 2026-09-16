@@ -5,13 +5,18 @@ import time
 import io
 import wave
 
-from config import GEMINI_TTS_MODEL, TTS_VOICE_NAME  # додати до існуючого імпорту з config
-
 from google import genai
 from google.genai import errors, types
 
-from config import GEMINI_API_KEY, GEMINI_MODEL, GEMINI_RPD_LIMIT, SYSTEM_PROMPT
-from config import GEMINI_API_KEY, GEMINI_MODEL, GEMINI_RPD_LIMIT, SYSTEM_PROMPT, TTS_RPD_LIMIT
+from config import (
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    GEMINI_RPD_LIMIT,
+    GEMINI_TTS_MODEL,
+    SYSTEM_PROMPT,
+    TTS_RPD_LIMIT,
+    TTS_VOICE_NAME,
+)
 
 log = logging.getLogger("Bashma4ek_Bot.gemini")
 

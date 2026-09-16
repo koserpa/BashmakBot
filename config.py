@@ -22,7 +22,8 @@ HISTORY_SIZE = int(os.getenv("HISTORY_SIZE", ""))
 
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
 TTS_VOICE_NAME = os.getenv("TTS_VOICE_NAME", "Kore")
-VOICE_REPLY_ENABLED = os.getenv("VOICE_REPLY_ENABLED", "true").lower() == "true"
+# Фіча-флаги (VOICE_REPLY_ENABLED і решта) тепер живуть в features.py —
+# один файл для всіх ввімкнено/вимкнено перемикачів бота.
 TTS_RPD_LIMIT = int(os.getenv("TTS_RPD_LIMIT", "10"))
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "koserpa").lstrip("@").lower()

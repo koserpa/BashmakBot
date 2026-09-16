@@ -5,21 +5,22 @@
 Перевірка активності — повністю детермінована (без викликів Gemini), щоб
 не бити по квоті на кожне повідомлення. До Gemini йде рівно один запит —
 уже коли поріг перевищено і вирішено, що варто щось написати."""
-import logging
 import os
 import time
 
 import bot_state
-
-log = logging.getLogger("Bashma4ek_Bot.drama")
-
-DRAMA_DETECTOR_ENABLED = os.getenv("DRAMA_DETECTOR_ENABLED", "true").lower() == "true"
+from detectors import CooldownGate
+from features import DRAMA_DETECTOR_ENABLED
 
 DRAMA_WINDOW_SEC = int(os.getenv("DRAMA_WINDOW_SEC", "90"))          # вікно для підрахунку активності
 DRAMA_MIN_MESSAGES = int(os.getenv("DRAMA_MIN_MESSAGES", "5"))        # мінімум повідомлень у вікні
 DRAMA_MIN_USERS = int(os.getenv("DRAMA_MIN_USERS", "2"))              # мінімум різних людей у вікні
 DRAMA_MIN_SCORE = int(os.getenv("DRAMA_MIN_SCORE", "3"))              # поріг сумарної "напруги"
 DRAMA_COOLDOWN_SEC = int(os.getenv("DRAMA_COOLDOWN_SEC", str(15 * 60)))  # не частіше разу на N сек на чат
+
+# store=bot_state.last_drama_intervention — щоб зберегти сумісність з рештою
+# коду, який тримає рантайм-стан централізовано в bot_state.py.
+_cooldown = CooldownGate(DRAMA_COOLDOWN_SEC, store=bot_state.last_drama_intervention)
 
 # Список навмисно "м'який" — це лише тригер для виявлення напруги,
 # а не список слів, які бот десь відтворює.
@@ -55,18 +56,15 @@ def _tension_score(text: str) -> int:
 
 def record_message(chat_id: int, user_id: int, text: str) -> None:
     """Фіксує повідомлення в буфері активності чату — викликається на
-    КОЖНЕ повідомлення в групі, незалежно від того, тегнули бота чи ні."""
+    КОЖНЕ повідомлення в групі, незалежно від того, тегнули бота чи ні.
+
+    Буфер (bot_state.message_activity) — deque(maxlen=40), тож старі
+    записи самі витісняються при переповненні."""
     if not DRAMA_DETECTOR_ENABLED:
         return
 
     now = time.time()
-    buf = bot_state.message_activity[chat_id]
-    buf.append((now, user_id, _tension_score(text)))
-
-    # Буфер має maxlen у bot_state, але додатково чистимо дуже старі
-    # записи, щоб is_drama_happening не тягнув зайве по часу.
-    while buf and now - buf[0][0] > DRAMA_WINDOW_SEC * 3:
-        buf.popleft()
+    bot_state.message_activity[chat_id].append((now, user_id, _tension_score(text)))
 
 
 def is_drama_happening(chat_id: int) -> bool:
@@ -89,14 +87,10 @@ def is_drama_happening(chat_id: int) -> bool:
     if total_score < DRAMA_MIN_SCORE:
         return False
 
-    last_time = bot_state.last_drama_intervention.get(chat_id, 0)
-    if now - last_time < DRAMA_COOLDOWN_SEC:
-        return False
-
-    return True
+    return _cooldown.is_ready(chat_id)
 
 
 def mark_drama_handled(chat_id: int) -> None:
     """Ставимо позначку ОДРАЗУ (до звернення до Gemini), щоб паралельні
     повідомлення, що прилетіли одночасно, не спричинили дублікат."""
-    bot_state.last_drama_intervention[chat_id] = time.time()
+    _cooldown.mark(chat_id)

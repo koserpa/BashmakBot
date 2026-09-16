@@ -55,6 +55,22 @@ async def download_telegram_file(bot: Bot, file_id: str) -> bytes | None:
         return None
 
 
+async def download_or_reply(bot: Bot, message: Message, file_id: str, error_text: str) -> bytes | None:
+    """Обгортка над download_telegram_file, яка сама відповідає
+    користувачу read-friendly помилкою при невдачі. Раніше кожен
+    медіа-хендлер (photo/sticker/animation/document/voice/video_note)
+    дублював:
+        data = await download_telegram_file(bot, file_id)
+        if data is None:
+            await message.reply("Не вдалось завантажити ... 😔")
+            return
+    тепер це один виклик — прибирає повторення та шанс забути обробити None."""
+    data = await download_telegram_file(bot, file_id)
+    if data is None:
+        await message.reply(error_text)
+    return data
+
+
 def extract_document_text(file_name: str, data: bytes, mime_type: str | None):
     """Готує вміст файлу для Gemini. Повертає (text_content, raw_part) —
     рівно одне з двох не None (raw_part для форматів, які Gemini читає

@@ -2,17 +2,14 @@
 довго не писала в чаті, а решта активна — бот може іноді підколоти її
 відсутність. На відміну від загального idle-watcher (тиша ВСЬОГО чату),
 тут стежимо за тишею ОКРЕМОЇ людини на фоні активного чату."""
-import logging
 import os
 import random
 import time
 
 import bot_state
 from config import USER_CONTEXT
-
-log = logging.getLogger("Bashma4ek_Bot.absence")
-
-ABSENCE_DETECTOR_ENABLED = os.getenv("ABSENCE_DETECTOR_ENABLED", "true").lower() == "true"
+from detectors import CooldownGate
+from features import ABSENCE_DETECTOR_ENABLED, ABSENCE_POKE_CHANCE
 
 # Скільки годин тиші від конкретної людини вважається "довгою відсутністю"
 ABSENCE_MIN_SILENCE_HOURS = float(os.getenv("ABSENCE_MIN_SILENCE_HOURS", "48"))
@@ -21,9 +18,9 @@ ABSENCE_MIN_SILENCE_HOURS = float(os.getenv("ABSENCE_MIN_SILENCE_HOURS", "48"))
 # нити про це в кожному повідомленні, поки вона нарешті не напише.
 ABSENCE_POKE_COOLDOWN_SEC = float(os.getenv("ABSENCE_POKE_COOLDOWN_SEC", str(24 * 3600)))
 
-# Ймовірність підколу навіть коли умови виконані — щоб це не спрацьовувало
-# щоразу механічно, а виглядало як випадкова репліка.
-ABSENCE_POKE_CHANCE = float(os.getenv("ABSENCE_POKE_CHANCE", "0.25"))
+# store=bot_state.last_absence_poke — щоб зберегти сумісність з рештою коду,
+# яка тримає рантайм-стан централізовано в bot_state.py.
+_cooldown = CooldownGate(ABSENCE_POKE_COOLDOWN_SEC, store=bot_state.last_absence_poke)
 
 
 def record_activity(chat_id: int, user_id: int, username: str, full_name: str) -> None:
@@ -64,8 +61,7 @@ def find_absent_candidate(chat_id: int, current_user_id: int):
         if silence_hours < ABSENCE_MIN_SILENCE_HOURS:
             continue
 
-        last_poke = bot_state.last_absence_poke.get((chat_id, user_id), 0)
-        if now - last_poke < ABSENCE_POKE_COOLDOWN_SEC:
+        if not _cooldown.is_ready((chat_id, user_id)):
             continue
 
         if best is None or silence_hours > best[3]:
@@ -75,7 +71,7 @@ def find_absent_candidate(chat_id: int, current_user_id: int):
 
 
 def mark_poked(chat_id: int, user_id: int) -> None:
-    bot_state.last_absence_poke[(chat_id, user_id)] = time.time()
+    _cooldown.mark((chat_id, user_id))
 
 
 def should_roll_poke() -> bool:

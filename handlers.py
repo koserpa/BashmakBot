@@ -6,33 +6,46 @@
 додаються в запит."""
 import asyncio
 import logging
+import os
 import random
-import re
 import time
+from typing import Awaitable, Callable
 
+import requests
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
-from aiogram.filters import Command
+from aiogram.filters import BaseFilter, Command
 from aiogram.types import BufferedInputFile, Message, ReactionTypeEmoji
 from google.genai import types
-import drama_utils
-import absence_utils
 
+import absence_utils
 import bot_state
-from config import GEMINI_MODEL, GEMINI_RPD_LIMIT, TRIGGER_NAMES, USER_CONTEXT
+import drama_utils
+from config import ADMIN_USERNAME, GEMINI_MODEL, GEMINI_RPD_LIMIT, TRIGGER_NAMES, USER_CONTEXT
+from features import (
+    REACT_UNPROMPTED_CHANCE,
+    REACT_UNPROMPTED_ENABLED,
+    VOICE_REPLY_ENABLED,
+    describe_flags,
+)
 from gemini_client import (
     ask_gemini,
     check_reaction_worthy,
     gemini_stats,
     parse_reaction_answer,
+    parse_voice_marker,
     quota_low,
+    synthesize_speech,
     transcribe_media,
+    tts_quota_low,
 )
 from media_utils import (
     build_reply_media_context,
+    download_or_reply,
     download_telegram_file,
     extract_document_text,
     trim_document_text,
+    wav_to_ogg_voice,
 )
 from search_utils import (
     get_current_date_str,
@@ -41,72 +54,44 @@ from search_utils import (
     is_weekend,
     needs_web_search,
 )
-from aiogram.filters import BaseFilter
-from config import ADMIN_USERNAME
-from config import GEMINI_MODEL, GEMINI_RPD_LIMIT, TRIGGER_NAMES, USER_CONTEXT, VOICE_REPLY_ENABLED
-from gemini_client import (
-    ask_gemini, check_reaction_worthy, gemini_stats,
-    parse_reaction_answer, quota_low, synthesize_speech, transcribe_media,
+from text_utils import (
+    get_mentioned_usernames,
+    strip_name_prefix,
+    strip_trigger,
+    text_mentions_bot_username,
+    text_mentions_trigger_name,
+    wants_forced_voice,
 )
-from media_utils import (
-    build_reply_media_context, download_telegram_file,
-    extract_document_text, trim_document_text, wav_to_ogg_voice,
-)
-from gemini_client import (
-    ask_gemini, check_reaction_worthy, gemini_stats,
-    parse_reaction_answer, parse_voice_marker, quota_low, synthesize_speech,
-    transcribe_media, tts_quota_low,
-)
+
+log = logging.getLogger("Bashma4ek_Bot.handlers")
+
 
 class IsAdmin(BaseFilter):
     async def __call__(self, message: Message) -> bool:
         username = (message.from_user.username or "").lstrip("@").lower() if message.from_user else ""
         return username == ADMIN_USERNAME
 
-log = logging.getLogger("Bashma4ek_Bot.handlers")
-
-# --- Реакції на повідомлення без тегу бота ----------------------------------
-REACT_UNPROMPTED_ENABLED_DEFAULT = True
-import os
-REACT_UNPROMPTED_ENABLED = os.getenv("REACT_UNPROMPTED_ENABLED", "true").lower() == "true"
-REACT_UNPROMPTED_CHANCE = float(os.getenv("REACT_UNPROMPTED_CHANCE", "0.35"))
 
 IMAGE_MIME_JPEG = "image/jpeg"
 
-FORCE_VOICE_TRIGGERS = {
-    "голосом", "войсом", "озвуч", "начитай", "проговори",
-    "скинь войс", "скажи вголос",
-}
+
+# --- Фонові таски (drama/absence/unprompted reactions) ----------------------
+# create_task() саме по собі не тримає посилання на об'єкт — теоретично GC
+# може прибрати таску до завершення. Тримаємо явний set() і одразу логуємо
+# будь-який виняток, який інакше мовчки загубився б у "fire-and-forget" виклику.
+_background_tasks: set[asyncio.Task] = set()
 
 
-def wants_forced_voice(text: str) -> bool:
-    text_lower = (text or "").lower()
-    return any(t in text_lower for t in FORCE_VOICE_TRIGGERS)
+def spawn_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
 
-_NAMES_ALT = "|".join(re.escape(n) for n in TRIGGER_NAMES)
-NAME_PATTERN = re.compile(
-    rf"(^\s*({_NAMES_ALT})\b)|(\b({_NAMES_ALT})\s*[,!?.]*\s*$)",
-    re.IGNORECASE,
-) if TRIGGER_NAMES else None
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            log.error("Фонова таска впала з помилкою", exc_info=t.exception())
 
-
-def strip_trigger(text: str, bot_username: str) -> str:
-    """Прибирає @згадку бота та тригер-ім'я з тексту питання."""
-    text = text or ""
-    text = text.replace(f"@{bot_username}", "")
-    if NAME_PATTERN:
-        text = NAME_PATTERN.sub("", text, count=1)
-    return text.strip(" ,:.!?-")
-
-
-def strip_name_prefix(text: str, sender: str, bot_name: str) -> str:
-    """Прибирає префікс на кшталт 'koserpa: ' або 'Башмак: ' з відповіді моделі."""
-    text = text.strip()
-    names = "|".join(re.escape(n) for n in {sender, bot_name, *TRIGGER_NAMES} if n)
-    if not names:
-        return text
-    text = re.sub(rf"^\s*(?:{names})\s*:\s*", "", text, count=1, flags=re.IGNORECASE)
-    return text.strip()
+    task.add_done_callback(_on_done)
 
 
 def was_mentioned(message: Message) -> bool:
@@ -119,13 +104,10 @@ def was_mentioned(message: Message) -> bool:
     if not text:
         return False
 
-    if bot_state.BOT_USERNAME and f"@{bot_state.BOT_USERNAME}".lower() in text.lower():
-        return True
-
-    if NAME_PATTERN and NAME_PATTERN.search(text):
-        return True
-
-    return False
+    return (
+        text_mentions_bot_username(text, bot_state.BOT_USERNAME)
+        or text_mentions_trigger_name(text)
+    )
 
 
 def get_sender_context(message: Message) -> str:
@@ -145,20 +127,13 @@ def get_sender_context(message: Message) -> str:
             return ctx  # backward-compat for plain-string entries
     return ""
 
+
 def get_full_context_raw(message: Message) -> str:
     """Повний контекст (style + sensitive) без обмежень — для приколів типу /gadalka."""
     if not message.from_user or not message.from_user.username:
         return ""
-    username = message.from_user.username.lstrip("@").lower()
-    for known_username, ctx in USER_CONTEXT.items():
-        if known_username.lower() == username:
-            if isinstance(ctx, dict):
-                parts = [ctx.get("style", "")]
-                if ctx.get("sensitive"):
-                    parts.append(ctx["sensitive"])
-                return " ".join(p for p in parts if p)
-            return ctx
-    return ""
+    return get_full_context_raw_by_username(message.from_user.username)
+
 
 def get_full_context_raw_by_username(username: str) -> str:
     """Те саме що get_full_context_raw, але за голим username (коли Message
@@ -173,13 +148,14 @@ def get_full_context_raw_by_username(username: str) -> str:
             return ctx
     return ""
 
+
 def get_mentioned_users_context(text: str) -> str:
     """Шукає в тексті @згадки відомих учасників (окрім самого бота) і
     повертає для них контекст із USER_CONTEXT."""
     if not text:
         return ""
 
-    mentioned_usernames = set(re.findall(r"@(\w+)", text))
+    mentioned_usernames = get_mentioned_usernames(text)
     bot_username_lower = (bot_state.BOT_USERNAME or "").lower()
 
     blocks = []
@@ -194,6 +170,7 @@ def get_mentioned_users_context(text: str) -> str:
     if not blocks:
         return ""
     return "\n[Про згаданих людей]:\n" + "\n".join(blocks)
+
 
 async def _send_voice_reply(bot: Bot, chat_id: int, text: str, reply_to_message_id: int) -> bool:
     """Повертає True, якщо голосове реально пішло — щоб виклик міг
@@ -225,7 +202,6 @@ async def _try_send_image_url(bot: Bot, chat_id: int, url: str) -> bool:
     """Качає картинку сама і перевіряє, що це валідне зображення, перш ніж
     слати в Telegram — деякі URL повертають 404 або HTML-заглушку замість
     картинки, і send_photo(url) не завжди це ловить."""
-    import requests
     try:
         resp = await asyncio.to_thread(
             requests.get,
@@ -279,6 +255,7 @@ async def maybe_react_unprompted(bot: Bot, message: Message, sender: str, conten
     except Exception:
         log.exception("Не вдалось поставити незапитану реакцію")
 
+
 async def maybe_intervene_drama(bot: Bot, message: Message) -> None:
     """Якщо детектор побачив 'срач' у чаті — генерує одне коротке
     втручання в стилі бота (не модераторський тон)."""
@@ -317,6 +294,7 @@ async def maybe_intervene_drama(bot: Bot, message: Message) -> None:
     except Exception:
         log.exception(f"Не вдалось надіслати drama-коментар в чат {chat_id}")
 
+
 async def maybe_poke_absent_user(bot: Bot, message: Message) -> None:
     """Якщо хтось відомий довго мовчить на фоні активного чату — іноді
     підколює його відсутність."""
@@ -335,7 +313,7 @@ async def maybe_poke_absent_user(bot: Bot, message: Message) -> None:
     absence_utils.mark_poked(chat_id, user_id)  # одразу, щоб не задвоїти
 
     days = silence_hours / 24
-    style = get_full_context_raw_by_username(username)  # див. нижче
+    style = get_full_context_raw_by_username(username)
     prompt = (
         f"{full_name} не писав(-ла) в чаті вже приблизно {days:.1f} дні. "
         f"Хтось щойно написав у чаті — на фоні цього встав ОДНЕ коротке "
@@ -373,14 +351,15 @@ def remember_only(bot: Bot, message: Message, sender: str, note: str) -> None:
     bot_state.history[message.chat.id].append(
         {"role": "user", "parts": [{"text": f"{sender}: {note}"}]}
     )
-    asyncio.create_task(maybe_react_unprompted(bot, message, sender, note))
+    spawn_background(maybe_react_unprompted(bot, message, sender, note))
 
 
 async def process_and_reply(
     bot: Bot, message: Message, sender: str, question_text: str, *,
-    extra_parts: list | None = None, history_label: str,
-    is_voice_input: bool = False,   # ← було also_voice_reply
+    extra_parts: list | None = None, history_label: str | None = None,
+    is_voice_input: bool = False,
 ) -> None:
+    history_label = history_label if history_label is not None else question_text
     chat_history = bot_state.history[message.chat.id]
 
     full_prompt_text = f"{sender}: {question_text}"
@@ -452,10 +431,42 @@ async def process_and_reply(
         await _try_send_image_url(bot, message.chat.id, url)
 
 
+# --- Спільний диспетчер для медіа-хендлерів ---------------------------------
+# Photo / sticker / animation / document мають однаковий каркас: якщо бота
+# не тегнули — просто запам'ятати подію й вийти; якщо тегнули — підготувати
+# (question_text, extra_parts, history_label) і піти в process_and_reply.
+# Voice / video_note свідомо тут не використовуються — транскрипція там
+# потрібна ДО перевірки was_mentioned (бо йде і в repam'ятовування теж).
+PrepareResult = tuple[str, list | None, str] | None
+PrepareFn = Callable[[], Awaitable[PrepareResult]]
+
+
+async def dispatch_media_event(
+    bot: Bot,
+    message: Message,
+    sender: str,
+    *,
+    not_mentioned_note: str,
+    prepare: PrepareFn,
+) -> None:
+    if not was_mentioned(message):
+        remember_only(bot, message, sender, not_mentioned_note)
+        return
+
+    result = await prepare()
+    if result is None:
+        return  # prepare() уже надіслав повідомлення про помилку сам
+
+    question_text, extra_parts, history_label = result
+    await process_and_reply(
+        bot, message, sender, question_text,
+        extra_parts=extra_parts,
+        history_label=history_label,
+    )
+
+
 async def send_idle_message(bot: Bot, chat_id: int) -> None:
     """Формує і надсилає одне проактивне повідомлення в тихий чат."""
-    from config import HISTORY_SIZE  # noqa: F401  (лишено для явності залежності)
-
     chat_history = bot_state.history[chat_id]
     contents = list(chat_history)
     idle_hours = float(os.getenv("IDLE_HOURS", "7"))
@@ -486,7 +497,7 @@ async def send_idle_message(bot: Bot, chat_id: int) -> None:
 
 
 async def idle_chat_watcher(bot: Bot):
-    """Раз на IDLE_CHECK_INTERVAL_SEC проходиться по відомих чатах: якщо
+    """Раз на idle_check_interval_sec проходиться по відомих чатах: якщо
     тиша довша за IDLE_HOURS і бот ще не писав за цей період тиші —
     надсилає одне проактивне повідомлення. У суботу та неділю проактивні
     повідомлення вимкнено."""
@@ -512,6 +523,7 @@ async def idle_chat_watcher(bot: Bot):
             except Exception:
                 log.exception(f"Не вдалось надіслати проактивне повідомлення в чат {chat_id}")
 
+
 def register_handlers(dp: Dispatcher, bot: Bot) -> None:
     """Реєструє всі хендлери в переданому Dispatcher. Bot передається явно
     (замість глобального імпорту), щоб handlers.py не залежав від того, де
@@ -533,8 +545,8 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             drama_utils.record_message(message.chat.id, user_id, text)
             absence_utils.record_activity(message.chat.id, user_id, username, full_name)
 
-            asyncio.create_task(maybe_intervene_drama(bot, message))
-            asyncio.create_task(maybe_poke_absent_user(bot, message))
+            spawn_background(maybe_intervene_drama(bot, message))
+            spawn_background(maybe_poke_absent_user(bot, message))
 
         return await handler(message, data)
 
@@ -549,9 +561,9 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             "Тільки для адміна:\n"
             "/reset — очистити пам'ять поточного чату\n"
             "/status — статус бота (uptime, розмір історії)\n"
-            "/model — інфо про модель та ліміти запитів"
+            "/model — інфо про модель та ліміти запитів\n"
+            "/features — які фіча-флаги зараз увімкнено"
         )
-            
 
     @dp.message(Command("reset"), IsAdmin())
     async def cmd_reset(message: Message):
@@ -589,6 +601,10 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
 
         await message.answer("\n".join(lines))
 
+    @dp.message(Command("features"), IsAdmin())
+    async def cmd_features(message: Message):
+        await message.answer("⚙️ Фіча-флаги\n" + describe_flags())
+
     @dp.message(Command("gadalka"))
     async def cmd_gadalka(message: Message):
         sender = message.from_user.full_name if message.from_user else "Хтось"
@@ -609,61 +625,56 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         )
         await message.reply(f"🔮 {answer}")
 
-    @dp.message(Command("start", "help", "reset", "status", "model"))
+    @dp.message(Command("start", "help", "reset", "status", "model", "features"))
     async def cmd_denied(message: Message):
         return  # мовчки ігноруємо чужі спроби викликати адмін-команди
 
     @dp.message(F.text)
     async def handle_message(message: Message):
         sender = message.from_user.full_name if message.from_user else "Хтось"
-        mentioned = was_mentioned(message)
 
-        if not mentioned:
-            remember_only(bot, message, sender, message.text)
-            return
+        async def prepare() -> PrepareResult:
+            question = strip_trigger(message.text, bot_state.BOT_USERNAME)
+            if not question:
+                question = "Привіт! Про що поговоримо?"
 
-        question = strip_trigger(message.text, bot_state.BOT_USERNAME)
-        if not question:
-            question = "Привіт! Про що поговоримо?"
+            extra_parts: list = []
+            replied = message.reply_to_message
+            if replied and (not replied.from_user or replied.from_user.id != bot_state.BOT_ID):
+                reply_parts, reply_description = await build_reply_media_context(
+                    bot, replied, transcribe_media
+                )
+                if reply_description:
+                    question = f"{question}\n{reply_description}" if question else reply_description
+                    extra_parts = reply_parts
 
-        extra_parts: list = []
-        replied = message.reply_to_message
-        if replied and (not replied.from_user or replied.from_user.id != bot_state.BOT_ID):
-            reply_parts, reply_description = await build_reply_media_context(
-                bot, replied, transcribe_media
-            )
-            if reply_description:
-                question = f"{question}\n{reply_description}" if question else reply_description
-                extra_parts = reply_parts
+            return question, (extra_parts or None), question
 
-        await process_and_reply(
-            bot, message, sender, question,
-            extra_parts=extra_parts or None,
-            history_label=question,
+        await dispatch_media_event(
+            bot, message, sender,
+            not_mentioned_note=message.text,
+            prepare=prepare,
         )
 
     @dp.message(F.photo)
     async def handle_photo(message: Message):
         sender = message.from_user.full_name if message.from_user else "Хтось"
         caption = message.caption or ""
-        mentioned = was_mentioned(message)
 
-        if not mentioned:
-            note = "[надіслав(-ла) фото]" + (f" {caption}" if caption else "")
-            remember_only(bot, message, sender, note)
-            return
+        async def prepare() -> PrepareResult:
+            question = strip_trigger(caption, bot_state.BOT_USERNAME) or "Що на цьому фото?"
+            image_bytes = await download_or_reply(
+                bot, message, message.photo[-1].file_id, "Не вдалось завантажити фото 😔"
+            )
+            if image_bytes is None:
+                return None
+            extra_parts = [types.Part.from_bytes(data=image_bytes, mime_type=IMAGE_MIME_JPEG)]
+            return question, extra_parts, f"[фото] {question}"
 
-        question = strip_trigger(caption, bot_state.BOT_USERNAME) or "Що на цьому фото?"
-        image_bytes = await download_telegram_file(bot, message.photo[-1].file_id)
-        if image_bytes is None:
-            await message.reply("Не вдалось завантажити фото 😔")
-            return
-
-        extra_parts = [types.Part.from_bytes(data=image_bytes, mime_type=IMAGE_MIME_JPEG)]
-        await process_and_reply(
-            bot, message, sender, question,
-            extra_parts=extra_parts,
-            history_label=f"[фото] {question}",
+        await dispatch_media_event(
+            bot, message, sender,
+            not_mentioned_note="[надіслав(-ла) фото]" + (f" {caption}" if caption else ""),
+            prepare=prepare,
         )
 
     @dp.message(F.sticker)
@@ -671,34 +682,38 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         sender = message.from_user.full_name if message.from_user else "Хтось"
         sticker = message.sticker
         emoji = sticker.emoji or "🙂"
-        mentioned = was_mentioned(message)
 
         # анімовані (.tgs) і відео-стікери (.webm) Gemini vision напряму не
         # їсть — фіксуємо тільки емодзі, без реального аналізу картинки.
         if sticker.is_animated or sticker.is_video:
-            if not mentioned:
-                remember_only(bot, message, sender, f"[анімований стікер {emoji}]")
-                return
-            await process_and_reply(
-                bot, message, sender, f"[надіслав(-ла) анімований стікер {emoji}]",
-                history_label=f"[анімований стікер {emoji}]",
+            async def prepare() -> PrepareResult:
+                label = f"[надіслав(-ла) анімований стікер {emoji}]"
+                return label, None, label
+
+            await dispatch_media_event(
+                bot, message, sender,
+                not_mentioned_note=f"[анімований стікер {emoji}]",
+                prepare=prepare,
             )
             return
 
-        if not mentioned:
-            remember_only(bot, message, sender, f"[надіслав(-ла) стікер {emoji}]")
-            return
+        async def prepare() -> PrepareResult:
+            sticker_bytes = await download_or_reply(
+                bot, message, sticker.file_id, "Не вдалось завантажити стікер 😔"
+            )
+            if sticker_bytes is None:
+                return None
+            extra_parts = [types.Part.from_bytes(data=sticker_bytes, mime_type="image/webp")]
+            return (
+                f"[надіслав(-ла) стікер, емодзі: {emoji}]",
+                extra_parts,
+                f"[надіслав(-ла) стікер {emoji}]",
+            )
 
-        sticker_bytes = await download_telegram_file(bot, sticker.file_id)
-        if sticker_bytes is None:
-            await message.reply("Не вдалось завантажити стікер 😔")
-            return
-
-        extra_parts = [types.Part.from_bytes(data=sticker_bytes, mime_type="image/webp")]
-        await process_and_reply(
-            bot, message, sender, f"[надіслав(-ла) стікер, емодзі: {emoji}]",
-            extra_parts=extra_parts,
-            history_label=f"[надіслав(-ла) стікер {emoji}]",
+        await dispatch_media_event(
+            bot, message, sender,
+            not_mentioned_note=f"[надіслав(-ла) стікер {emoji}]",
+            prepare=prepare,
         )
 
     @dp.message(F.animation)
@@ -706,37 +721,41 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         """GIF в Telegram технічно приходить як mp4 без звуку (F.animation)."""
         sender = message.from_user.full_name if message.from_user else "Хтось"
         caption = message.caption or ""
-        mentioned = was_mentioned(message)
-
-        if not mentioned:
-            note = "[надіслав(-ла) гіфку]" + (f" {caption}" if caption else "")
-            remember_only(bot, message, sender, note)
-            return
-
         animation = message.animation
-        if animation.file_size and animation.file_size > 20 * 1024 * 1024:
-            await message.reply("Гіфка більша за 20 МБ — стільки бот завантажити не може 😔")
-            return
 
-        animation_bytes = await download_telegram_file(bot, animation.file_id)
-        if animation_bytes is None:
-            await message.reply("Не вдалось завантажити гіфку 😔")
-            return
+        async def prepare() -> PrepareResult:
+            if animation.file_size and animation.file_size > 20 * 1024 * 1024:
+                await message.reply("Гіфка більша за 20 МБ — стільки бот завантажити не може 😔")
+                return None
 
-        question = strip_trigger(caption, bot_state.BOT_USERNAME) or "Що відбувається на цій гіфці?"
-        extra_parts = [types.Part.from_bytes(data=animation_bytes, mime_type="video/mp4")]
-        await process_and_reply(
-            bot, message, sender, question,
-            extra_parts=extra_parts,
-            history_label=f"[гіфка] {question}",
+            animation_bytes = await download_or_reply(
+                bot, message, animation.file_id, "Не вдалось завантажити гіфку 😔"
+            )
+            if animation_bytes is None:
+                return None
+
+            question = strip_trigger(caption, bot_state.BOT_USERNAME) or "Що відбувається на цій гіфці?"
+            extra_parts = [types.Part.from_bytes(data=animation_bytes, mime_type="video/mp4")]
+            return question, extra_parts, f"[гіфка] {question}"
+
+        await dispatch_media_event(
+            bot, message, sender,
+            not_mentioned_note="[надіслав(-ла) гіфку]" + (f" {caption}" if caption else ""),
+            prepare=prepare,
         )
 
     @dp.message(F.video_note)
     async def handle_video_note(message: Message):
-        """Кружки: транскрибуємо мовлення так само, як голосові."""
+        """Кружки: транскрибуємо мовлення так само, як голосові. Транскрипт
+        потрібен і для 'просто запамʼятати', і для відповіді — тому
+        загальний dispatch_media_event тут не підходить (транскрипція має
+        відбутись ДО перевірки was_mentioned)."""
         sender = message.from_user.full_name if message.from_user else "Хтось"
         mentioned = was_mentioned(message)
 
+        # Помилку показуємо лише якщо бота тегнули — інакше мовчки ігноруємо
+        # (як і решта "не тегнули" гілок), тому тут звичайний
+        # download_telegram_file, а не download_or_reply.
         video_note_bytes = await download_telegram_file(bot, message.video_note.file_id)
         if video_note_bytes is None:
             if mentioned:
@@ -805,43 +824,39 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         caption = message.caption or ""
         doc = message.document
         file_name = doc.file_name or "файл"
-        mentioned = was_mentioned(message)
 
-        if not mentioned:
-            note = f"[надіслав(-ла) файл {file_name}]" + (f" {caption}" if caption else "")
-            remember_only(bot, message, sender, note)
-            return
+        async def prepare() -> PrepareResult:
+            if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+                await message.reply("Файл більший за 20 МБ — стільки бот завантажити не може 😔")
+                return None
 
-        if doc.file_size and doc.file_size > 20 * 1024 * 1024:
-            await message.reply("Файл більший за 20 МБ — стільки бот завантажити не може 😔")
-            return
+            data = await download_or_reply(bot, message, doc.file_id, "Не вдалось завантажити файл 😔")
+            if data is None:
+                return None
 
-        data = await download_telegram_file(bot, doc.file_id)
-        if data is None:
-            await message.reply("Не вдалось завантажити файл 😔")
-            return
+            text_content, raw_part = extract_document_text(file_name, data, doc.mime_type)
 
-        text_content, raw_part = extract_document_text(file_name, data, doc.mime_type)
+            if text_content is None and raw_part is None:
+                await message.reply(
+                    f"Не вмію читати такий формат ({file_name}). "
+                    "Підтримую PDF, DOCX, XLSX, PPTX і звичайні текстові файли "
+                    "(txt, csv, json, md тощо)."
+                )
+                return None
 
-        if text_content is None and raw_part is None:
-            await message.reply(
-                f"Не вмію читати такий формат ({file_name}). "
-                "Підтримую PDF, DOCX, XLSX, PPTX і звичайні текстові файли "
-                "(txt, csv, json, md тощо)."
-            )
-            return
+            question = strip_trigger(caption, bot_state.BOT_USERNAME) or "Опрацюй цей файл і розкажи головне."
+            question_text = f"{question}\n\n[Файл: {file_name}]"
 
-        question = strip_trigger(caption, bot_state.BOT_USERNAME) or "Опрацюй цей файл і розкажи головне."
-        question_text = f"{question}\n\n[Файл: {file_name}]"
+            extra_parts = None
+            if raw_part is not None:
+                extra_parts = [raw_part]
+            else:
+                question_text += f"\n\nВміст файлу:\n{trim_document_text(text_content)}"
 
-        extra_parts = None
-        if raw_part is not None:
-            extra_parts = [raw_part]
-        else:
-            question_text += f"\n\nВміст файлу:\n{trim_document_text(text_content)}"
+            return question_text, extra_parts, f"[файл {file_name}] {question}"
 
-        await process_and_reply(
-            bot, message, sender, question_text,
-            extra_parts=extra_parts,
-            history_label=f"[файл {file_name}] {question}",
+        await dispatch_media_event(
+            bot, message, sender,
+            not_mentioned_note=f"[надіслав(-ла) файл {file_name}]" + (f" {caption}" if caption else ""),
+            prepare=prepare,
         )

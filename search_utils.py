@@ -258,9 +258,38 @@ def _tavily_search_sync(query: str, want_images: bool = False) -> tuple[str, lis
     return text_result, image_urls
 
 
+def classify_query(query: str) -> set[str]:
+    """Визначає, які джерела варто опитати для цього запиту. Раніше ця
+    логіка була розмазана прямо по get_web_context — тепер додавання нової
+    категорії (спорт, крипта тощо) означає одну нову гілку тут, а не
+    правку функції, що ще й займається склеюванням результатів."""
+    text_lower = (query or "").lower()
+    categories: set[str] = set()
+
+    is_curr = is_currency_query(query)
+    is_weath = is_weather_query(query)
+    if is_curr:
+        categories.add("currency")
+    if is_weath:
+        categories.add("weather")
+
+    # Загальний пошук (Tavily) — якщо є "звичайні" тригери, окрім тих, що
+    # вже покриті курсом/погодою (щоб не втратити другу частину змішаного
+    # запиту типу "яка погода і хто виграв матч").
+    remaining_triggers = SEARCH_TRIGGERS - CURRENCY_TRIGGER_WORDS - WEATHER_TRIGGER_WORDS
+    generic_search_needed = (
+        (needs_web_search(query) and not (is_curr or is_weath))
+        or any(t in text_lower for t in remaining_triggers)
+    )
+    if generic_search_needed:
+        categories.add("tavily")
+
+    return categories
+
+
 async def get_web_context(query: str) -> tuple[str, list[str]]:
-    """Головна точка входу: визначає які джерела опитати (курс/погода/
-    Tavily), склеює результати і повертає (текст, картинки)."""
+    """Головна точка входу: визначає які джерела опитати (через
+    classify_query), склеює результати і повертає (текст, картинки)."""
     cache_key = query.strip().lower()
     want_images = is_image_query(query)
 
@@ -269,31 +298,21 @@ async def get_web_context(query: str) -> tuple[str, list[str]]:
         log.info(f"Пошук: кеш-хіт для запиту {query!r}")
         return cached, []
 
+    categories = classify_query(query)
     parts: list[str] = []
     image_urls: list[str] = []
 
-    is_curr = is_currency_query(query)
-    is_weath = is_weather_query(query)
-
-    if is_curr:
+    if "currency" in categories:
         currency_info = await asyncio.to_thread(_currency_sync, detect_currency_codes(query))
         if currency_info:
             parts.append(currency_info)
 
-    if is_weath:
+    if "weather" in categories:
         weather_info = await asyncio.to_thread(_weather_sync, extract_weather_city(query))
         if weather_info:
             parts.append(weather_info)
 
-    # Tavily виконуємо додатково, якщо в запиті є звичайні пошукові тригери
-    # (не тільки курс/погода) — щоб не губити другу частину змішаного
-    # запиту типу "яка погода і хто виграв матч".
-    should_search_tavily = needs_web_search(query) and not (is_curr or is_weath)
-    if not should_search_tavily and (is_curr or is_weath):
-        remaining_triggers = SEARCH_TRIGGERS - CURRENCY_TRIGGER_WORDS - WEATHER_TRIGGER_WORDS
-        should_search_tavily = any(t in query.lower() for t in remaining_triggers)
-
-    if should_search_tavily:
+    if "tavily" in categories:
         tavily_text, image_urls = await asyncio.to_thread(_tavily_search_sync, query, want_images)
         if tavily_text:
             parts.append(tavily_text)
