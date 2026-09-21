@@ -2,8 +2,7 @@
 неділі в Польщі без використання платних API або квот Gemini.
 
 - Niedziele handlowe (Торгові неділі): за польським законодавством торгівля
-  дозволена у 7 визначених неділь на рік. Розраховується автоматично +
-  календар на 2025–2027 роки.
+  дозволена у 7 визначених неділь на рік. Розраховується автоматично.
 - Święta państwowe (Державні свята): 13 офіційних неробочих днів. Запитуються
   через публічне безкоштовне Nager.Date API (з кешуванням на 24г) та локальним
   fallback-списком.
@@ -11,16 +10,23 @@
 import datetime
 import json
 import logging
-import re
 import time
 import urllib.request
 import urllib.error
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger("Bashma4ek_Bot.poland")
+
+TZ = ZoneInfo("Europe/Warsaw")
 
 # Кеш для свят: {year: (timestamp, [holidays])}
 _HOLIDAYS_CACHE: dict[int, tuple[float, list[dict]]] = {}
 _CACHE_TTL_SEC = 24 * 3600
+
+
+def _today() -> datetime.date:
+    """Сьогоднішня дата у Варшаві (на Koyeb системний пояс — UTC)."""
+    return datetime.datetime.now(TZ).date()
 
 
 def _get_easter_date(year: int) -> datetime.date:
@@ -142,7 +148,7 @@ def fetch_holidays(year: int) -> list[dict]:
 def get_sunday_shopping_info(target_date: datetime.date | None = None) -> str:
     """Повертає деталі про торгові неділі відносно поточної або переданої дати."""
     if target_date is None:
-        target_date = datetime.date.today()
+        target_date = _today()
 
     # Знаходимо найближчу неділю
     days_until_sunday = (6 - target_date.weekday()) % 7
@@ -175,7 +181,7 @@ def get_sunday_shopping_info(target_date: datetime.date | None = None) -> str:
 def get_upcoming_holidays(limit: int = 3, target_date: datetime.date | None = None) -> str:
     """Повертає найближчі державні свята та вихідні дні в Польщі."""
     if target_date is None:
-        target_date = datetime.date.today()
+        target_date = _today()
 
     holidays = fetch_holidays(target_date.year)
     if target_date.month >= 11:
@@ -226,7 +232,7 @@ def is_poland_calendar_query(text: str) -> bool:
 
 def get_poland_context(query: str) -> str:
     """Генерує контекст для LLM про польські неділі чи свята без використання Gemini або Tavily."""
-    today = datetime.date.today()
+    today = _today()
     q = (query or "").lower()
 
     parts = []

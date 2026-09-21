@@ -9,8 +9,11 @@ import logging
 import os
 import re
 import time
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger("Bashma4ek_Bot.reminders")
+
+TZ = ZoneInfo("Europe/Warsaw")
 
 REMINDERS_FILE = os.path.join(os.path.dirname(__file__), "data", "reminders.json")
 
@@ -49,10 +52,14 @@ def _next_id() -> int:
     return max(r.get("id", 0) for r in _reminders) + 1
 
 
+def _fmt_dt(ts: float) -> str:
+    return datetime.datetime.fromtimestamp(ts, TZ).strftime("%H:%M:%S (%d.%m)")
+
+
 def parse_time_spec(text: str) -> tuple[float | None, str]:
     """Парсить часову специфікацію на початку рядка:
     1) Відносний час: '15m', '2h', '45s', '1h30m', '10 хв'
-    2) Абсолютний час: '14:30', '8.00' (за поточним локальним часом/Варшава)
+    2) Абсолютний час: '14:30', '8.00' (за часом Європа/Варшава)
 
     Повертає (target_timestamp, remaining_text) або (None, error_msg).
     """
@@ -69,7 +76,7 @@ def parse_time_spec(text: str) -> tuple[float | None, str]:
         minute = int(abs_match.group(2))
         rest = abs_match.group(3).strip()
         if 0 <= hour <= 23:
-            now_dt = datetime.datetime.now()
+            now_dt = datetime.datetime.now(TZ)
             target_dt = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if target_dt.timestamp() <= now_ts:
                 # Якщо цей час сьогодні вже минув — ставимо на завтра
@@ -77,7 +84,6 @@ def parse_time_spec(text: str) -> tuple[float | None, str]:
             return target_dt.timestamp(), rest
 
     # 2. Перевірка на відносний час (комбінація годин, хвилин, секунд)
-    # Знайдемо всі часові кванти на початку рядка
     pattern = re.compile(
         r"^(\d+)\s*(секунд[иу]?|sec|сек|s|минут[иу]?|хвилин[иу]?|min|хв|мин|m|години?|часов|часа|час|год|hr|h|дней|днів|день|дня|d)(?=[0-9\s.,!?:;_-]|$)\s*",
         re.IGNORECASE,
@@ -148,9 +154,8 @@ def add_reminder(chat_id: int, user_id: int, user_mention: str, args_text: str) 
     _reminders.append(rem)
     _save()
 
-    dt_str = datetime.datetime.fromtimestamp(target_ts).strftime("%H:%M:%S (%d.%m)")
     return (
-        f"✅ Нагадування #{r_id} встановлено на <b>{dt_str}</b>:\n"
+        f"✅ Нагадування #{r_id} встановлено на <b>{_fmt_dt(target_ts)}</b>:\n"
         f"📝 <i>{reminder_text}</i>"
     )
 
@@ -169,12 +174,11 @@ def list_reminders(chat_id: int) -> str:
         user = r.get("user_mention", "Хтось")
         text = r.get("text", "")
         remind_at = r.get("remind_at", 0)
-        dt_str = datetime.datetime.fromtimestamp(remind_at).strftime("%H:%M:%S (%d.%m)")
         remaining_sec = max(int(remind_at - now), 0)
         m, s = divmod(remaining_sec, 60)
         h, m = divmod(m, 60)
         time_left = f"{h}г {m}хв" if h else (f"{m}хв {s}с" if m else f"{s}с")
-        lines.append(f"• #{r_id} [через {time_left} о {dt_str}] ({user}): <i>{text}</i>")
+        lines.append(f"• #{r_id} [через {time_left} о {_fmt_dt(remind_at)}] ({user}): <i>{text}</i>")
 
     lines.append("\nЩоб скасувати: <code>/remind_del &lt;номер&gt;</code>")
     return "\n".join(lines)

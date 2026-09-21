@@ -104,7 +104,7 @@ def needs_web_search(text: str) -> bool:
     return any(trigger in text_lower for trigger in SEARCH_TRIGGERS)
 
 
-# --- Кеш пошукових запитів ---------------------------------------------------
+# --- Кеш пошукових запитів (лише текст Tavily) -------------------------------
 SEARCH_CACHE_TTL_SEC = 5 * 60
 _search_cache: dict[str, tuple[float, str]] = {}
 
@@ -341,7 +341,8 @@ async def get_web_context(
     Крок 1: грубий фільтр (needs_web_search) — без витрат квоти.
     Крок 2: LLM-класифікація (classify_search_query) — дешевий запит,
             повертає очищений запит або None.
-    Кешування по нормалізованому очищеному запиту.
+    Кешується ТІЛЬКИ текст Tavily (валюта/погода/розклад беруться свіжими
+    і додаються окремо — щоб блоки не дублювались).
     При невдалому Tavily — підмішується явне попередження моделі.
     """
     # Lazy import — уникаємо циклу на рівні модулів
@@ -368,7 +369,7 @@ async def get_web_context(
             parts.append(weather_info)
 
     if "poland" in categories:
-    poland_info = await asyncio.to_thread(poland_utils.get_poland_context, query)
+        poland_info = await asyncio.to_thread(poland_utils.get_poland_context, query)
         if poland_info:
             parts.append(poland_info)
 
@@ -389,37 +390,31 @@ async def get_web_context(
         needs_web_search(query)
         and (not local_covered or has_news_intent)
     )
-    refined_query: str | None = None
 
-    if should_search_tavily:
+    if not should_search_tavily:
+        return "\n".join(parts), []
 
-        if want_images:
-            # Зображення — одразу в Tavily, без класифікатора
-            refined_query = query
-        else:
-            # Крок 2: LLM вирішує остаточно і нормалізує запит
-            refined_query = await classify_search_query(query, chat_history)
+    if want_images:
+        # Зображення — одразу в Tavily, без класифікатора
+        refined_query: str | None = query
+    else:
+        # Крок 2: LLM вирішує остаточно і нормалізує запит
+        refined_query = await classify_search_query(query, chat_history)
 
-            if refined_query is None:
-                log.info(f"Пошук: LLM вирішив НЕ шукати для {query!r}")
-                # Якщо є вже результати (валюта/погода) — повертаємо їх
-                if parts:
-                    text_result = "\n".join(parts)
-                    _cache_set(_normalize_query(query), text_result)
-                    return text_result, []
-                return "", []
+    if refined_query is None:
+        log.info(f"Пошук: LLM вирішив НЕ шукати для {query!r}")
+        return "\n".join(parts), []
 
-    # --- Перевірка кешу по нормалізованому запиту ---
-    cache_key = _normalize_query(refined_query or query)
-    cached = _cache_get(cache_key)
-    if cached is not None and not want_images:
-        log.info(f"Пошук: кеш-хіт для {refined_query or query!r}")
-        if parts:
-            return "\n".join(parts) + cached, []
-        return cached, []
+    # --- Перевірка кешу (тільки текст Tavily, не для картинок) ---
+    cache_key = _normalize_query(refined_query)
+    if not want_images:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            log.info(f"Пошук: кеш-хіт для {refined_query!r}")
+            return "\n".join(parts + [cached]), []
 
     # --- Формуємо фінальний запит з датою для новин ---
-    effective_query = refined_query or query
+    effective_query = refined_query
     is_news = _is_news_query(effective_query) or _is_news_query(query)
 
     if is_news:
@@ -431,28 +426,24 @@ async def get_web_context(
         log.info(f"Пошук: {effective_query!r} (оригінал: {query!r})")
 
     # --- Виклик Tavily ---
-    if refined_query is not None:
-        tavily_text, image_urls = await asyncio.to_thread(
-            _tavily_search_sync, effective_query, want_images, is_news
+    tavily_text, image_urls = await asyncio.to_thread(
+        _tavily_search_sync, effective_query, want_images, is_news
+    )
+
+    if tavily_text == SEARCH_FAILED_MARKER:
+        # Tavily впав — додаємо явне попередження моделі
+        parts.append(
+            "\n\n[⚠ Пошук в інтернеті не вдався — "
+            "не вигадуй актуальні факти, відповідай лише на основі "
+            "загальних знань і чітко скажи, що не маєш свіжих даних]"
         )
+        log.warning(f"Tavily не відповів для запиту {effective_query!r}")
+    elif tavily_text:
+        parts.append(tavily_text)
+        if not want_images:
+            _cache_set(cache_key, tavily_text)
 
-        if tavily_text == SEARCH_FAILED_MARKER:
-            # Tavily впав — додаємо явне попередження моделі
-            parts.append(
-                "\n\n[⚠ Пошук в інтернеті не вдався — "
-                "не вигадуй актуальні факти, відповідай лише на основі "
-                "загальних знань і чітко скажи, що не маєш свіжих даних]"
-            )
-            log.warning(f"Tavily не відповів для запиту {effective_query!r}")
-        elif tavily_text:
-            parts.append(tavily_text)
-
-    text_result = "\n".join(parts)
-
-    if text_result and not want_images and SEARCH_FAILED_MARKER not in text_result:
-        _cache_set(cache_key, text_result)
-
-    return text_result, image_urls
+    return "\n".join(parts), image_urls
 
 
 # --- Синхронізація поточної дати з інтернету ---------------------------------

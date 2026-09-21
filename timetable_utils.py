@@ -6,8 +6,11 @@ import datetime
 import json
 import logging
 import os
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger("Bashma4ek_Bot.timetable")
+
+TZ = ZoneInfo("Europe/Warsaw")
 
 TIMETABLE_FILE = os.path.join(os.path.dirname(__file__), "data", "timetable.json")
 
@@ -70,7 +73,7 @@ def get_schedule(arg: str = "") -> str:
         return "⚠️ Розклад поки не налаштовано або файл розкладу порожній."
 
     arg_clean = arg.strip().lower()
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(TZ)
     weekday = now.weekday()  # 0: Monday, 6: Sunday
 
     # Якщо запит на весь тиждень

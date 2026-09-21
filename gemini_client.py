@@ -49,6 +49,7 @@ ALLOWED_REACTIONS = {
 
 _gemini_sem = asyncio.Semaphore(2)
 
+
 async def ask_gemini(contents, current_date_str):
     async with _gemini_sem:
         return await _ask_gemini_inner(contents, current_date_str)
@@ -79,6 +80,7 @@ def tts_quota_low() -> bool:
     добу) — перевіряємо окремо, щоб не спамити 429 в логи."""
     return tts_stats.count_today >= TTS_RPD_LIMIT
 
+
 def quota_low() -> bool:
     """Чи близько до денного ліміту Gemini — якщо так, фонові
     (не обов'язкові) запити варто пропускати, щоб не з'їсти квоту
@@ -100,6 +102,7 @@ def parse_reaction_answer(answer: str) -> str | None:
     log.warning(f"Модель попросила недозволену реакцію: {emoji!r}, ігнорую маркер")
     return None
 
+
 def parse_voice_marker(answer: str) -> tuple[bool, str]:
     """Перевіряє, чи модель попросила озвучити відповідь через маркер
     VOICE: на початку. Повертає (чи_треба_голос, текст_без_маркера)."""
@@ -107,6 +110,7 @@ def parse_voice_marker(answer: str) -> tuple[bool, str]:
     if stripped.startswith(VOICE_PREFIX):
         return True, stripped[len(VOICE_PREFIX):].strip()
     return False, answer
+
 
 def _build_system_instruction(current_date_str: str) -> str:
     return (
@@ -198,11 +202,11 @@ async def _ask_gemini_inner(contents: list, current_date_str: str) -> str:
             )
 
         if attempt < GEMINI_MAX_RETRIES:
-            import asyncio
-            await asyncio.sleep(GEMINI_RETRY_DELAY)
+            await asyncio.sleep(GEMINI_RETRY_DELAY * (attempt + 1))
 
     log.error(f"ask_gemini: усі спроби вичерпано, остання помилка: {last_error}")
     return "Не вдалося сформулювати відповідь 😔"
+
 
 async def synthesize_speech(text: str) -> bytes | None:
     if tts_quota_low():
@@ -242,7 +246,7 @@ async def synthesize_speech(text: str) -> bytes | None:
 async def transcribe_media(data: bytes, mime_type: str, kind_label: str) -> str:
     """Спільна логіка транскрибування аудіо/відео (voice / video_note)."""
     if quota_low():
-    return ""      # у classify_search_query: return None
+        return ""
     contents = [
         {
             "role": "user",
@@ -312,7 +316,7 @@ async def classify_search_query(text: str, history_snippet: list[dict]) -> str |
     правильно розв'язати неповні запити типу «а скільки він коштує?».
     """
     if quota_low():
-    return ""      # у classify_search_query: return None
+        return None
     # Будуємо компактний контекст з останніх повідомлень
     history_lines: list[str] = []
     for msg in history_snippet:
