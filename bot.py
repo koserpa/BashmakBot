@@ -18,6 +18,7 @@ from aiohttp import web
 import bot_state
 from config import BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL
 from handlers import idle_chat_watcher, register_handlers
+from reminder_utils import reminders_watcher
 from search_utils import date_sync_watcher, refresh_current_date
 
 logging.basicConfig(level=logging.INFO)
@@ -91,6 +92,9 @@ async def main():
     asyncio.create_task(idle_chat_watcher(bot))
     idle_hours = float(os.getenv("IDLE_HOURS", "7"))
     log.info(f"Спостерігач за тишею в чаті запущено (поріг {idle_hours}г)")
+
+    asyncio.create_task(reminders_watcher(bot))
+    log.info("Воркер нагадувань запущено")
 
     await dp.start_polling(bot)
 

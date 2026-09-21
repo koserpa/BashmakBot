@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import string
 import time
 
 import requests
@@ -12,29 +13,46 @@ from config import TAVILY_API_KEY
 
 log = logging.getLogger("Bashma4ek_Bot.search")
 
-# --- Тригери для веб-пошуку -------------------------------------------------
-# Рішення "шукати чи ні" приймається в коді напряму (детерміновано), а не
-# моделлю через function calling — той підхід виявився нестабільним з
-# gemini-3.1-flash-lite.
+# --- Грубі тригери — перший бар'єр (без витрат квоти) ----------------------
+# Якщо жодного з цих слів немає — LLM взагалі не кликається.
+# Список свідомо вузький: тільки слова, що МАЙЖЕ завжди означають реальний
+# пошук (не "коли підемо гуляти", не "курс лекцій").
 SEARCH_TRIGGERS = {
-    # укр
-    "знайди", "гугл", "пошукай", "новини", "погода", "прогноз",
-    "курс", "курси", "долар", "євро", "зарплат", "ціна", "ціни",
-    "сьогодні", "зараз", "актуальн", "останні", "свіж",
-    "інтернет", "найди", "хто такий", "хто така",
-    "коли", "скільки коштує", "де знаходиться", "що сталося", "що відбулось",
-    # рос (Влад і Саша частіше пишуть/отримують відповіді російською)
-    "найди", "погугли", "поищи", "новост", "прогноз погоды",
-    "курс", "доллар", "евро", "зарплат", "цена", "цены",
-    "сегодня", "сейчас", "актуальн", "последние", "свеж",
-    "интернет", "кто такой", "кто такая",
-    "когда", "сколько стоит", "где находится", "что случилось", "что произошло",
-    # універсальні / інші мови
-    "search", "google",
+    # укр — явні пошукові наміри
+    "знайди", "пошукай", "погугли", "загугли", "новини", "погода", "прогноз",
+    "долар", "євро", "гривня", "злотий",
+    "актуальн", "останні новини", "свіжі новини",
+    "скільки коштує", "де знаходиться", "що сталося", "що відбулось",
+    "хто такий", "хто така", "розклад", "результат матч",
+    # рос
+    "найди", "поищи", "погугли", "новост", "прогноз погоды",
+    "доллар", "евро", "гривны",
+    "последние новости", "свежие новости",
+    "сколько стоит", "где находится", "что случилось", "что произошло",
+    "кто такой", "кто такая", "расписание",
+    # en / universal
+    "search", "google", "find me", "latest news", "current price",
+    "who is", "what is", "when did", "how much",
+    # польська — для запитів про Польщу
+    "znajdź", "poszukaj", "aktualne", "cena", "kurs",
 }
 
-MAX_SEARCH_RESULTS = 5
-MAX_FETCH_CHARS = 6000
+# Слова, що можуть входити до SEARCH_TRIGGERS але в даному контексті майже
+# ніколи не означають реальний пошук — використовуємо як стоп-список
+# щоб не кликати LLM на очевидно нерелевантні запити.
+_COARSE_FALSE_POSITIVE_PATTERNS = [
+    r"\bкурс\s+лекц",        # "курс лекцій"
+    r"\bкурс\s+навч",        # "курс навчання"
+    r"\bкурсов[иі]\s+роб",   # "курсова робота"
+    r"\bкурс\s+програм",     # "курс програмування"
+    r"\bрозклад\s+уроків",   # "розклад уроків" (часто жартівливий контекст)
+]
+
+MAX_SEARCH_RESULTS = 3          # топ-3 джерела в промпт
+MAX_FETCH_CHARS = 1500          # символів на результат (було 6000)
+
+# Маркер, який підмішується в промпт при невдалому пошуку
+SEARCH_FAILED_MARKER = "__SEARCH_FAILED__"
 
 IMAGE_SEARCH_TRIGGERS = {
     "покажи", "покажі", "як виглядає", "як виглядають", "фото", "фотку",
@@ -43,22 +61,50 @@ IMAGE_SEARCH_TRIGGERS = {
     "как выглядит", "как выглядят", "фотка", "изображение",
 }
 
+# Ключові слова для новинного запиту
+_NEWS_KEYWORDS = {
+    "новини", "новость", "новости", "новину",
+    "останні", "последние", "latest", "свіжі", "свеж",
+    "що сталося", "що відбулось", "что случилось", "что произошло",
+    "what happened", "breaking",
+}
+
 
 def is_image_query(text: str) -> bool:
     text_lower = (text or "").lower()
     return any(t in text_lower for t in IMAGE_SEARCH_TRIGGERS)
 
 
+def _is_news_query(query: str) -> bool:
+    """Чи схожий запит на новинний? Використовується для Tavily topic=news."""
+    q = (query or "").lower()
+    return any(kw in q for kw in _NEWS_KEYWORDS)
+
+
+def _normalize_query(q: str) -> str:
+    """Нормалізує запит для використання як кеш-ключа:
+    нижній регістр, без пунктуації, зайвих пробілів."""
+    q = q.lower()
+    # прибираємо знаки пунктуації
+    q = q.translate(str.maketrans("", "", string.punctuation + '«»„"'))
+    # стискаємо пробіли
+    return " ".join(q.split())
+
+
 def needs_web_search(text: str) -> bool:
-    """Перевіряє, чи варто автоматично зробити пошук в інтернеті."""
+    """Грубий фільтр першого рівня: чи є в тексті хоча б один тригер?
+    Якщо так — треба додатково перевірити через LLM."""
     text_lower = (text or "").lower()
+
+    # Перевіряємо стоп-патерни — якщо збіг є, одразу False
+    for pat in _COARSE_FALSE_POSITIVE_PATTERNS:
+        if re.search(pat, text_lower):
+            return False
+
     return any(trigger in text_lower for trigger in SEARCH_TRIGGERS)
 
 
 # --- Кеш пошукових запитів ---------------------------------------------------
-# Якщо кілька людей підряд запитують те саме (наприклад "яка погода?"),
-# не варто бити по зовнішньому API двічі — тримаємо результат кілька
-# хвилин в пам'яті.
 SEARCH_CACHE_TTL_SEC = 5 * 60
 _search_cache: dict[str, tuple[float, str]] = {}
 
@@ -76,15 +122,12 @@ def _cache_get(key: str) -> str | None:
 
 def _cache_set(key: str, value: str) -> None:
     _search_cache[key] = (time.time(), value)
-    # Проста самоочистка, щоб словник не ріс нескінченно в довгоживучому процесі.
     if len(_search_cache) > 200:
         oldest_key = min(_search_cache, key=lambda k: _search_cache[k][0])
         _search_cache.pop(oldest_key, None)
 
 
 # --- Курс валют (НБП — Народний банк Польщі) --------------------------------
-# Бот у Польщі, тож база — PLN. Швидше й точніше за пошук по інтернету для
-# цієї конкретної, дуже частої категорії запитів.
 CURRENCY_TRIGGER_WORDS = {
     "курс", "курси", "курсы", "долар", "доллар", "євро", "евро",
     "гривня", "гривны", "гривень", "злотий", "злотых", "злотого", "фунт",
@@ -132,8 +175,6 @@ def _currency_sync(codes: list[str]) -> str:
 
 
 # --- Погода (Open-Meteo) -----------------------------------------------------
-# Безкоштовний API без ключа, точніший і швидший за скрейпінг для цієї
-# категорії запитів.
 WEATHER_TRIGGER_WORDS = {"погода", "погоду", "погоди", "прогноз погоды", "прогноз погоди"}
 DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "Bytom")
 _WEATHER_STOPWORDS = {
@@ -148,8 +189,6 @@ def is_weather_query(text: str) -> bool:
 
 
 def extract_weather_city(text: str) -> str:
-    """Намагається витягти назву міста після слова 'погода' (напр. 'погода
-    у Варшаві'). Якщо не вдалось — використовує місто за замовчуванням."""
     match = re.search(
         r"погод[аиу]?\s*(?:в|у|на)?\s*([A-Za-zА-Яа-яЇїІіЄєҐґ\-]{3,30})",
         text,
@@ -205,32 +244,48 @@ def _weather_sync(city: str) -> str:
 
 
 # --- Загальний пошук в інтернеті (Tavily) ------------------------------------
-# Tavily заточений під LLM-агентів: одразу повертає очищений релевантний
-# контент по кожному результату (не треба окремо парсити HTML сторінки, як
-# із сирими сніпетами DuckDuckGo).
-def _tavily_search_sync(query: str, want_images: bool = False) -> tuple[str, list[str]]:
+def _tavily_search_sync(
+    query: str,
+    want_images: bool = False,
+    is_news: bool = False,
+) -> tuple[str, list[str]]:
+    """Виконує пошук через Tavily.
+
+    - is_news=True: topic="news", days=3, search_depth="advanced"
+    - is_news=False: topic="general", search_depth="advanced" (після LLM-класифікації
+      запит вже підтверджений — варто шукати якісно)
+    - Повертає SEARCH_FAILED_MARKER замість порожнього рядка при помилці,
+      щоб у промпт можна було підмішати явне попередження моделі.
+    """
     if not TAVILY_API_KEY:
         log.error("TAVILY_API_KEY не задано в .env — пошук в інтернеті вимкнено")
-        return "", []
+        return SEARCH_FAILED_MARKER, []
 
-    payload = {
+    payload: dict = {
         "api_key": TAVILY_API_KEY,
         "query": query,
-        "search_depth": "basic",
+        "search_depth": "advanced",   # завжди advanced — запит вже перевірений LLM
         "max_results": MAX_SEARCH_RESULTS,
         "include_answer": True,
     }
+
+    if is_news:
+        payload["topic"] = "news"
+        payload["days"] = 3
+    else:
+        payload["topic"] = "general"
+
     if want_images:
         payload["include_images"] = True
         payload["include_image_descriptions"] = True
 
     try:
-        resp = requests.post("https://api.tavily.com/search", json=payload, timeout=10)
+        resp = requests.post("https://api.tavily.com/search", json=payload, timeout=12)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         log.error(f"Помилка пошуку Tavily: {e}")
-        return "", []
+        return SEARCH_FAILED_MARKER, []
 
     lines = ["\n\n[Знайдена актуальна інформація з інтернету]:"]
 
@@ -247,10 +302,11 @@ def _tavily_search_sync(query: str, want_images: bool = False) -> tuple[str, lis
         lines.append(f"- {title}: {content} ({url})")
 
     text_result = "" if len(lines) == 1 else "\n".join(lines)
+    if not text_result:
+        return SEARCH_FAILED_MARKER, []
 
     image_urls: list[str] = []
     for img in data.get("images", [])[:3]:
-        # З include_image_descriptions=True кожен елемент — dict {"url": ..., "description": ...}
         url = img.get("url") if isinstance(img, dict) else img
         if url:
             image_urls.append(url)
@@ -259,45 +315,44 @@ def _tavily_search_sync(query: str, want_images: bool = False) -> tuple[str, lis
 
 
 def classify_query(query: str) -> set[str]:
-    """Визначає, які джерела варто опитати для цього запиту. Раніше ця
-    логіка була розмазана прямо по get_web_context — тепер додавання нової
-    категорії (спорт, крипта тощо) означає одну нову гілку тут, а не
-    правку функції, що ще й займається склеюванням результатів."""
-    text_lower = (query or "").lower()
+    """Визначає, які спеціалізовані джерела (currency, weather, poland, timetable) потрібні.
+    Tavily тепер підключається не тут, а після LLM-класифікації в get_web_context."""
+    import poland_utils
+    import timetable_utils
+
     categories: set[str] = set()
-
-    is_curr = is_currency_query(query)
-    is_weath = is_weather_query(query)
-    if is_curr:
+    if is_currency_query(query):
         categories.add("currency")
-    if is_weath:
+    if is_weather_query(query):
         categories.add("weather")
-
-    # Загальний пошук (Tavily) — якщо є "звичайні" тригери, окрім тих, що
-    # вже покриті курсом/погодою (щоб не втратити другу частину змішаного
-    # запиту типу "яка погода і хто виграв матч").
-    remaining_triggers = SEARCH_TRIGGERS - CURRENCY_TRIGGER_WORDS - WEATHER_TRIGGER_WORDS
-    generic_search_needed = (
-        (needs_web_search(query) and not (is_curr or is_weath))
-        or any(t in text_lower for t in remaining_triggers)
-    )
-    if generic_search_needed:
-        categories.add("tavily")
-
+    if poland_utils.is_poland_calendar_query(query):
+        categories.add("poland")
+    if timetable_utils.is_timetable_query(query):
+        categories.add("timetable")
     return categories
 
 
-async def get_web_context(query: str) -> tuple[str, list[str]]:
-    """Головна точка входу: визначає які джерела опитати (через
-    classify_query), склеює результати і повертає (текст, картинки)."""
-    cache_key = query.strip().lower()
+async def get_web_context(
+    query: str,
+    chat_history: list[dict] | None = None,
+) -> tuple[str, list[str]]:
+    """Головна точка входу: двоступеневий фільтр + пошук.
+
+    Крок 1: грубий фільтр (needs_web_search) — без витрат квоти.
+    Крок 2: LLM-класифікація (classify_search_query) — дешевий запит,
+            повертає очищений запит або None.
+    Кешування по нормалізованому очищеному запиту.
+    При невдалому Tavily — підмішується явне попередження моделі.
+    """
+    # Lazy import — уникаємо циклу на рівні модулів
+    from gemini_client import classify_search_query
+    import poland_utils
+    import timetable_utils
+
     want_images = is_image_query(query)
+    chat_history = chat_history or []
 
-    cached = _cache_get(cache_key)
-    if cached is not None and not want_images:
-        log.info(f"Пошук: кеш-хіт для запиту {query!r}")
-        return cached, []
-
+    # --- Спеціалізовані джерела (валюта, погода, польський календар, розклад) ---
     categories = classify_query(query)
     parts: list[str] = []
     image_urls: list[str] = []
@@ -312,34 +367,100 @@ async def get_web_context(query: str) -> tuple[str, list[str]]:
         if weather_info:
             parts.append(weather_info)
 
-    if "tavily" in categories:
-        tavily_text, image_urls = await asyncio.to_thread(_tavily_search_sync, query, want_images)
-        if tavily_text:
+    if "poland" in categories:
+        poland_info = poland_utils.get_poland_context(query)
+        if poland_info:
+            parts.append(poland_info)
+
+    if "timetable" in categories:
+        timetable_info = timetable_utils.get_schedule_context(query)
+        if timetable_info:
+            parts.append(timetable_info)
+
+    # --- Tavily: двоступеневий фільтр ---
+    # Для картинок LLM-класифікацію пропускаємо — тригер вже спрацював
+    # надійно (is_image_query), запит передаємо як є.
+    # Якщо запит вже повністю покрито локальними джерелами (валюта/погода/Польща/розклад)
+    # без явного запиту на свіжі новини/веб — економимо запит до Tavily!
+    local_covered = bool(categories) and not want_images
+    has_news_intent = _is_news_query(query)
+
+    should_search_tavily = want_images or (
+        needs_web_search(query)
+        and (not local_covered or has_news_intent)
+    )
+    refined_query: str | None = None
+
+    if should_search_tavily:
+
+        if want_images:
+            # Зображення — одразу в Tavily, без класифікатора
+            refined_query = query
+        else:
+            # Крок 2: LLM вирішує остаточно і нормалізує запит
+            refined_query = await classify_search_query(query, chat_history)
+
+            if refined_query is None:
+                log.info(f"Пошук: LLM вирішив НЕ шукати для {query!r}")
+                # Якщо є вже результати (валюта/погода) — повертаємо їх
+                if parts:
+                    text_result = "\n".join(parts)
+                    _cache_set(_normalize_query(query), text_result)
+                    return text_result, []
+                return "", []
+
+    # --- Перевірка кешу по нормалізованому запиту ---
+    cache_key = _normalize_query(refined_query or query)
+    cached = _cache_get(cache_key)
+    if cached is not None and not want_images:
+        log.info(f"Пошук: кеш-хіт для {refined_query or query!r}")
+        if parts:
+            return "\n".join(parts) + cached, []
+        return cached, []
+
+    # --- Формуємо фінальний запит з датою для новин ---
+    effective_query = refined_query or query
+    is_news = _is_news_query(effective_query) or _is_news_query(query)
+
+    if is_news:
+        date_str = get_current_date_str()
+        if date_str and date_str[:10] not in effective_query:
+            effective_query = f"{effective_query} {date_str[:10]}"
+        log.info(f"Пошук (новини): {effective_query!r}")
+    else:
+        log.info(f"Пошук: {effective_query!r} (оригінал: {query!r})")
+
+    # --- Виклик Tavily ---
+    if refined_query is not None:
+        tavily_text, image_urls = await asyncio.to_thread(
+            _tavily_search_sync, effective_query, want_images, is_news
+        )
+
+        if tavily_text == SEARCH_FAILED_MARKER:
+            # Tavily впав — додаємо явне попередження моделі
+            parts.append(
+                "\n\n[⚠ Пошук в інтернеті не вдався — "
+                "не вигадуй актуальні факти, відповідай лише на основі "
+                "загальних знань і чітко скажи, що не маєш свіжих даних]"
+            )
+            log.warning(f"Tavily не відповів для запиту {effective_query!r}")
+        elif tavily_text:
             parts.append(tavily_text)
 
     text_result = "\n".join(parts)
 
-    if text_result and not want_images:
+    if text_result and not want_images and SEARCH_FAILED_MARKER not in text_result:
         _cache_set(cache_key, text_result)
 
     return text_result, image_urls
 
 
 # --- Синхронізація поточної дати з інтернету ---------------------------------
-# System time на хостингу зазвичай і так вірний, але тримаємо це окремо
-# від локального часу процесу: якщо хостинг "засне"/зависне на довго
-# (наприклад free-план), процес міг не помітити, що час зсунувся.
 DATE_SYNC_INTERVAL_SEC = 8 * 3600
-
-# Рядок, що підмішується моделі як "сьогоднішня дата" — оновлюється фоновою
-# таскою. Стартове значення — локальний час, щоб бот не був "без дати" до
-# першого успішного запиту.
 current_date_str: str = time.strftime("%Y-%m-%d (%A)")
 
 
 def _fetch_current_date_sync() -> str | None:
-    """Тягне поточну дату з публічного time-API (без ключа). При невдачі
-    повертає None — виклик просто залишить попереднє значення."""
     try:
         resp = requests.get(
             "https://timeapi.io/api/time/current/zone",
@@ -377,10 +498,7 @@ _WEEKEND_DAY_NAMES = {"saturday", "sunday"}
 
 
 def is_weekend() -> bool:
-    """Чи зараз вихідний (субота/неділя) — за назвою дня тижня, яку тягне
-    timeapi.io разом з датою (напр. '2026-09-05 (Saturday)'). Якщо назву
-    дня розпізнати не вдалось — вважаємо, що НЕ вихідний, щоб через баг
-    парсингу проактивні повідомлення не заблокувались назавжди."""
+    """Чи зараз вихідний (субота/неділя) — за назвою дня тижня."""
     match = re.search(r"\(([A-Za-z]+)\)", current_date_str)
     if not match:
         return False

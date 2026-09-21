@@ -21,6 +21,8 @@ from google.genai import types
 import absence_utils
 import bot_state
 import drama_utils
+import reminder_utils
+import timetable_utils
 from config import ADMIN_USERNAME, GEMINI_MODEL, GEMINI_RPD_LIMIT, TRIGGER_NAMES, USER_CONTEXT
 from features import (
     REACT_UNPROMPTED_CHANCE,
@@ -362,12 +364,21 @@ async def process_and_reply(
     history_label = history_label if history_label is not None else question_text
     chat_history = bot_state.history[message.chat.id]
 
+    image_was_requested = is_image_query(question_text)
     full_prompt_text = f"{sender}: {question_text}"
     image_urls: list[str] = []
-    if needs_web_search(question_text) or is_image_query(question_text):
-        web_info, image_urls = await get_web_context(question_text)
+    if needs_web_search(question_text) or image_was_requested:
+        web_info, image_urls = await get_web_context(
+            question_text,
+            chat_history=list(chat_history)[-4:],
+        )
         if web_info:
             full_prompt_text += web_info
+
+    # Якщо просили картинку, але нічого не знайшли — говоримо моделі про це,
+    # щоб вона відповіла текстом, а не реакцією.
+    if image_was_requested and not image_urls:
+        full_prompt_text += "\n[Зображення не знайдено — відповідай текстом, поясни що не вдалося знайти фото]"
 
     sender_context = get_sender_context(message)
     if sender_context:
@@ -404,7 +415,9 @@ async def process_and_reply(
         {"role": "user", "parts": [{"text": f"{sender}: {history_label}"}]}
     )
 
-    reaction_emoji = parse_reaction_answer(answer) if not image_urls else None
+    # Якщо запитували картинку — реакція завжди заборонена, навіть якщо
+    # image_urls порожній (не знайшли фото). Модель має відповісти текстом.
+    reaction_emoji = parse_reaction_answer(answer) if not image_was_requested else None
 
     if reaction_emoji:
         chat_history.append(
@@ -557,7 +570,11 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             f"({', '.join(TRIGGER_NAMES)}).\n\n"
             "Для обичних смертних:\n"
             "/help — цей список команд\n"
-            "/gadalka — робе прогноз на основі історії чата і контекста\n"
+            "/rozklad [день] — розклад пар 2TC (сьогодні/завтра/день/тиждень)\n"
+            "/remind <час> <текст> — поставити нагадування (/remind 15m піти їсти)\n"
+            "/reminders — список активних нагадувань у чаті\n"
+            "/remind_del <номер> — скасувати нагадування\n"
+            "/gadalka — робе прогноз на основі історії чата і контекста\n\n"
             "Тільки для адміна:\n"
             "/reset — очистити пам'ять поточного чату\n"
             "/status — статус бота (uptime, розмір історії)\n"
@@ -624,6 +641,48 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             get_current_date_str(),
         )
         await message.reply(f"🔮 {answer}")
+
+    @dp.message(Command("rozklad", "schedule"))
+    async def cmd_rozklad(message: Message):
+        arg = ""
+        if message.text:
+            parts = message.text.split(maxsplit=1)
+            if len(parts) > 1:
+                arg = parts[1]
+        resp = timetable_utils.get_schedule(arg)
+        await message.reply(resp)
+
+    @dp.message(Command("remind"))
+    async def cmd_remind(message: Message):
+        if not message.text:
+            return
+        parts = message.text.split(maxsplit=1)
+        args_text = parts[1] if len(parts) > 1 else ""
+        user_id = message.from_user.id if message.from_user else 0
+        user_mention = (
+            f"@{message.from_user.username}"
+            if message.from_user and message.from_user.username
+            else (message.from_user.full_name if message.from_user else "Хтось")
+        )
+        resp = reminder_utils.add_reminder(message.chat.id, user_id, user_mention, args_text)
+        await message.reply(resp)
+
+    @dp.message(Command("reminders"))
+    async def cmd_reminders(message: Message):
+        resp = reminder_utils.list_reminders(message.chat.id)
+        await message.reply(resp)
+
+    @dp.message(Command("remind_del"))
+    async def cmd_remind_del(message: Message):
+        if not message.text:
+            return
+        parts = message.text.split(maxsplit=1)
+        r_id_str = parts[1] if len(parts) > 1 else ""
+        user_id = message.from_user.id if message.from_user else 0
+        username = (message.from_user.username or "").lstrip("@").lower() if message.from_user else ""
+        is_admin = (username == ADMIN_USERNAME)
+        resp = reminder_utils.delete_reminder(message.chat.id, r_id_str, user_id, is_admin)
+        await message.reply(resp)
 
     @dp.message(Command("start", "help", "reset", "status", "model", "features"))
     async def cmd_denied(message: Message):

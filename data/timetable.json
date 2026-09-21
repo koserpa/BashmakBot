@@ -1,0 +1,58 @@
+{
+  "group": "2TC (CosinusYoung 15+ Bytom)",
+  "schedule": {
+    "monday": {
+      "name": "Понеділок",
+      "lessons": [
+        {"num": 1, "time": "08:00 - 08:45", "subject": "Програмування додатків (Programowanie aplikacji)", "room": "204"},
+        {"num": 2, "time": "08:50 - 09:35", "subject": "Програмування додатків (Programowanie aplikacji)", "room": "204"},
+        {"num": 3, "time": "09:45 - 10:30", "subject": "Бази даних (Bazy danych)", "room": "205"},
+        {"num": 4, "time": "10:35 - 11:20", "subject": "Бази даних (Bazy danych)", "room": "205"},
+        {"num": 5, "time": "11:40 - 12:25", "subject": "Математика (Matematyka)", "room": "102"},
+        {"num": 6, "time": "12:30 - 13:15", "subject": "Польська мова (Język polski)", "room": "105"}
+      ]
+    },
+    "tuesday": {
+      "name": "Вівторок",
+      "lessons": [
+        {"num": 1, "time": "08:00 - 08:45", "subject": "Комп'ютерні мережі (Sieci komputerowe)", "room": "203"},
+        {"num": 2, "time": "08:50 - 09:35", "subject": "Комп'ютерні мережі (Sieci komputerowe)", "room": "203"},
+        {"num": 3, "time": "09:45 - 10:30", "subject": "Англійська мова (Język angielski)", "room": "108"},
+        {"num": 4, "time": "10:35 - 11:20", "subject": "Операційні системи (Systemy operacyjne)", "room": "203"},
+        {"num": 5, "time": "11:40 - 12:25", "subject": "Фізкультура (WF)", "room": "Спортзал"},
+        {"num": 6, "time": "12:30 - 13:15", "subject": "Фізкультура (WF)", "room": "Спортзал"}
+      ]
+    },
+    "wednesday": {
+      "name": "Середа",
+      "lessons": [
+        {"num": 1, "time": "08:50 - 09:35", "subject": "Історія (Historia)", "room": "104"},
+        {"num": 2, "time": "09:45 - 10:30", "subject": "Програмування (Programowanie)", "room": "204"},
+        {"num": 3, "time": "10:35 - 11:20", "subject": "Програмування (Programowanie)", "room": "204"},
+        {"num": 4, "time": "11:40 - 12:25", "subject": "Математика (Matematyka)", "room": "102"},
+        {"num": 5, "time": "12:30 - 13:15", "subject": "Польська мова (Język polski)", "room": "105"},
+        {"num": 6, "time": "13:20 - 14:05", "subject": "Година з вихователем (Godzina z wychowawcą)", "room": "105"}
+      ]
+    },
+    "thursday": {
+      "name": "Четвер",
+      "lessons": [
+        {"num": 1, "time": "08:00 - 08:45", "subject": "Веб-розробка (Witryny i aplikacje internetowe)", "room": "204"},
+        {"num": 2, "time": "08:50 - 09:35", "subject": "Веб-розробка (Witryny i aplikacje internetowe)", "room": "204"},
+        {"num": 3, "time": "09:45 - 10:30", "subject": "Бази даних (Bazy danych)", "room": "205"},
+        {"num": 4, "time": "10:35 - 11:20", "subject": "Фізика (Fizyka)", "room": "110"},
+        {"num": 5, "time": "11:40 - 12:25", "subject": "Англійська мова (Język angielski)", "room": "108"}
+      ]
+    },
+    "friday": {
+      "name": "П'ятниця",
+      "lessons": [
+        {"num": 1, "time": "08:00 - 08:45", "subject": "Програмування додатків (Programowanie aplikacji)", "room": "204"},
+        {"num": 2, "time": "08:50 - 09:35", "subject": "Програмування додатків (Programowanie aplikacji)", "room": "204"},
+        {"num": 3, "time": "09:45 - 10:30", "subject": "Графіка та комп'ютерна анімація", "room": "206"},
+        {"num": 4, "time": "10:35 - 11:20", "subject": "Математика (Matematyka)", "room": "102"},
+        {"num": 5, "time": "11:40 - 12:25", "subject": "Географія / Суспільствознавство", "room": "107"}
+      ]
+    }
+  }
+}

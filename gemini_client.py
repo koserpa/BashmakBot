@@ -288,3 +288,60 @@ async def check_reaction_worthy(sender: str, content_text: str) -> str | None:
         return None
 
     return answer if answer in ALLOWED_REACTIONS else None
+
+
+async def classify_search_query(text: str, history_snippet: list[dict]) -> str | None:
+    """Дешевий LLM-запит: чи потрібен пошук в інтернеті для цього повідомлення?
+
+    Якщо так — повертає нормалізований пошуковий запит (3-8 слів) з
+    правильною мовою (англ. для міжнародних тем типу ігор/tech/аніме,
+    польська для польських тем — Битом, ціни, технікум; укр/рос для решти).
+    Якщо пошук не потрібен — повертає None.
+
+    Приймає history_snippet — останні 3-4 повідомлення чату, щоб
+    правильно розв'язати неповні запити типу «а скільки він коштує?».
+    """
+    # Будуємо компактний контекст з останніх повідомлень
+    history_lines: list[str] = []
+    for msg in history_snippet:
+        role = "Бот" if msg.get("role") == "model" else "Юзер"
+        parts = msg.get("parts", [])
+        for part in parts:
+            if isinstance(part, dict) and part.get("text"):
+                history_lines.append(f"{role}: {part['text'][:200]}")
+            elif hasattr(part, "text") and part.text:
+                history_lines.append(f"{role}: {part.text[:200]}")
+
+    history_block = "\n".join(history_lines[-6:]) if history_lines else "(немає)"
+
+    prompt = (
+        f"Контекст останніх повідомлень чату:\n{history_block}\n\n"
+        f"Нове повідомлення: \"{text}\"\n\n"
+        "Завдання: чи потрібен пошук в інтернеті для відповіді на це повідомлення?\n"
+        "Пошук потрібен для: актуальних фактів, новин, цін, погоди, розкладів, "
+        "конкретних даних що можуть змінюватись (але НЕ для жартів, особистих питань, "
+        "буденних фраз типу 'коли підемо гуляти', 'зараз прийду', 'курс лекцій').\n"
+        "Якщо пошук ПОТРІБЕН: виведи ТІЛЬКИ короткий пошуковий запит (3-8 слів).\n"
+        "  - Для міжнародних тем (ігри, tech, аніме, спорт) — запит англійською.\n"
+        "  - Для польських тем (Битом, ціни в Польщі, польські новини) — польською.\n"
+        "  - Для решти — мовою оригіналу.\n"
+        "  - Якщо запит неповний ('а скільки він коштує?') — використай контекст вище.\n"
+        "Якщо пошук НЕ ПОТРІБЕН: виведи рівно слово NONE.\n"
+        "Без пояснень, без лапок, без крапки в кінці."
+    )
+
+    gemini_stats.record()
+    try:
+        response = await ai_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[{"role": "user", "parts": [{"text": prompt}]}],
+            config=types.GenerateContentConfig(max_output_tokens=20, temperature=0.1),
+        )
+        answer = (response.text or "").strip().strip('"').strip("'").rstrip(".")
+    except Exception:
+        log.exception("Не вдалось класифікувати пошуковий запит")
+        return None
+
+    if answer.upper() == "NONE" or not answer:
+        return None
+    return answer
