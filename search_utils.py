@@ -368,12 +368,12 @@ async def get_web_context(
             parts.append(weather_info)
 
     if "poland" in categories:
-        poland_info = poland_utils.get_poland_context(query)
+    poland_info = await asyncio.to_thread(poland_utils.get_poland_context, query)
         if poland_info:
             parts.append(poland_info)
 
     if "timetable" in categories:
-        timetable_info = timetable_utils.get_schedule_context(query)
+        timetable_info = await asyncio.to_thread(timetable_utils.get_schedule_context, query)
         if timetable_info:
             parts.append(timetable_info)
 

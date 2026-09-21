@@ -4,6 +4,8 @@ import logging
 import time
 import io
 import wave
+import asyncio
+
 
 from google import genai
 from google.genai import errors, types
@@ -44,6 +46,12 @@ ALLOWED_REACTIONS = {
     "🆒", "💘", "🙉", "🦄", "😘", "💊", "🙊", "😎", "👾", "🤷‍♂",
     "🤷", "🤷‍♀", "😡", "🤙",
 }
+
+_gemini_sem = asyncio.Semaphore(2)
+
+async def ask_gemini(contents, current_date_str):
+    async with _gemini_sem:
+        return await _ask_gemini_inner(contents, current_date_str)
 
 
 # --- Лічильник запитів до Gemini (для /model, без походу в логи) -----------
@@ -148,7 +156,7 @@ def _build_system_instruction(current_date_str: str) -> str:
     )
 
 
-async def ask_gemini(contents: list, current_date_str: str) -> str:
+async def _ask_gemini_inner(contents: list, current_date_str: str) -> str:
     """Викликає Gemini API. Пошук в інтернеті вже підмішаний у текст промпту
     заздалегідь (детерміновано, у хендлерах) — сюди він приходить готовим.
     При тимчасових (мережа/сервер) помилках робить кілька повторних спроб."""
@@ -233,6 +241,8 @@ async def synthesize_speech(text: str) -> bytes | None:
 
 async def transcribe_media(data: bytes, mime_type: str, kind_label: str) -> str:
     """Спільна логіка транскрибування аудіо/відео (voice / video_note)."""
+    if quota_low():
+    return ""      # у classify_search_query: return None
     contents = [
         {
             "role": "user",
@@ -301,6 +311,8 @@ async def classify_search_query(text: str, history_snippet: list[dict]) -> str |
     Приймає history_snippet — останні 3-4 повідомлення чату, щоб
     правильно розв'язати неповні запити типу «а скільки він коштує?».
     """
+    if quota_low():
+    return ""      # у classify_search_query: return None
     # Будуємо компактний контекст з останніх повідомлень
     history_lines: list[str] = []
     for msg in history_snippet:
