@@ -19,6 +19,10 @@ from config import (
     TTS_RPD_LIMIT,
     TTS_VOICE_NAME,
 )
+import os
+GEMINI_MAX_RETRIES = 3
+GEMINI_RETRY_DELAY = 3.0   # 3с, 6с, 9с
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
 
 log = logging.getLogger("Bashma4ek_Bot.gemini")
 
@@ -90,17 +94,48 @@ def quota_low() -> bool:
     return gemini_stats.count_today >= GEMINI_RPD_LIMIT * 0.9  # залишок < 10%
 
 
+_VS16 = "\ufe0f"
+
+# нормалізований (без FE0F) -> канонічний варіант зі списку Telegram
+_ALLOWED_NORM = {e.replace(_VS16, ""): e for e in ALLOWED_REACTIONS}
+
+# найближчі дозволені заміни для емодзі, яких Telegram не дає ботам
+REACTION_ALIASES = {
+    "✌": "👌", "👋": "🤝", "😂": "🤣", "😆": "😁", "😄": "😁", "😅": "😁",
+    "🙂": "👍", "😊": "🥰", "✅": "👍", "💪": "🔥", "👊": "🤝", "🤞": "🙏",
+    "🥳": "🎉", "😏": "😈", "😔": "😢", "🥲": "😢", "😤": "😡", "🤌": "👌",
+}
+REACTION_FALLBACK = "👍"
+
+
+def resolve_reaction(raw: str) -> str:
+    """Завжди повертає валідне емодзі-реакцію: точний збіг -> перший символ
+    -> аліас -> запасний варіант. Сирий маркер більше ніколи не витече в чат."""
+    raw = (raw or "").strip().replace(_VS16, "")
+    candidates = [raw, raw[:1]] if raw else []
+    for c in candidates:
+        if c in _ALLOWED_NORM:
+            return _ALLOWED_NORM[c]
+        if c in REACTION_ALIASES:
+            return REACTION_ALIASES[c]
+    log.warning(f"Модель попросила недозволену реакцію: {raw!r}, підміняю на {REACTION_FALLBACK}")
+    return REACTION_FALLBACK
+
+
 def parse_reaction_answer(answer: str) -> str | None:
-    """Якщо відповідь моделі — це маркер REACTION:<емодзі>, повертає сам
-    емодзі (якщо він у дозволеному списку). Інакше None."""
-    stripped = answer.strip()
+    stripped = (answer or "").strip()
     if not stripped.startswith(REACTION_PREFIX):
         return None
-    emoji = stripped[len(REACTION_PREFIX):].strip()
-    if emoji in ALLOWED_REACTIONS:
-        return emoji
-    log.warning(f"Модель попросила недозволену реакцію: {emoji!r}, ігнорую маркер")
-    return None
+    return resolve_reaction(stripped[len(REACTION_PREFIX):])
+
+
+def strip_reaction_marker(answer: str) -> str:
+    """Для випадків, коли реакція заборонена (напр. просили картинку), а модель
+    все одно видала маркер — прибираємо його, щоб не світився в чаті."""
+    stripped = (answer or "").strip()
+    if stripped.startswith(REACTION_PREFIX):
+        return ""
+    return answer
 
 
 def parse_voice_marker(answer: str) -> tuple[bool, str]:
@@ -161,25 +196,35 @@ def _build_system_instruction(current_date_str: str) -> str:
 
 
 async def _ask_gemini_inner(contents: list, current_date_str: str) -> str:
-    """Викликає Gemini API. Пошук в інтернеті вже підмішаний у текст промпту
-    заздалегідь (детерміновано, у хендлерах) — сюди він приходить готовим.
-    При тимчасових (мережа/сервер) помилках робить кілька повторних спроб."""
     last_error: Exception | None = None
     system_instruction = _build_system_instruction(current_date_str)
 
     for attempt in range(GEMINI_MAX_RETRIES + 1):
+        # на останній спробі пробуємо запасну модель, якщо вона задана
+        model = GEMINI_MODEL
+        if attempt == GEMINI_MAX_RETRIES and GEMINI_FALLBACK_MODEL:
+            model = GEMINI_FALLBACK_MODEL
+
         gemini_stats.record()
         try:
             response = await ai_client.aio.models.generate_content(
-                model=GEMINI_MODEL,
+                model=model,
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    max_output_tokens=600,
+                    max_output_tokens=1024,   # thinking-токени теж рахуються сюди
                     temperature=0.7,
                 ),
             )
-            return (response.text or "").strip()
+            text = (response.text or "").strip()
+            if text:
+                return text
+
+            finish = None
+            if response.candidates:
+                finish = response.candidates[0].finish_reason
+            log.warning(f"Порожня відповідь Gemini (finish_reason={finish}), спроба {attempt + 1}")
+            last_error = RuntimeError(f"empty response, finish_reason={finish}")
 
         except errors.ClientError as e:
             if e.code == 429:
@@ -190,16 +235,10 @@ async def _ask_gemini_inner(contents: list, current_date_str: str) -> str:
 
         except errors.ServerError as e:
             last_error = e
-            log.warning(
-                f"Тимчасова помилка Gemini API (спроба {attempt + 1}/"
-                f"{GEMINI_MAX_RETRIES + 1}): {e}"
-            )
+            log.warning(f"Тимчасова помилка Gemini API (спроба {attempt + 1}/{GEMINI_MAX_RETRIES + 1}): {e}")
         except Exception as e:
             last_error = e
-            log.warning(
-                f"Несподівана помилка в ask_gemini (спроба {attempt + 1}/"
-                f"{GEMINI_MAX_RETRIES + 1}): {e}"
-            )
+            log.warning(f"Несподівана помилка в ask_gemini (спроба {attempt + 1}/{GEMINI_MAX_RETRIES + 1}): {e}")
 
         if attempt < GEMINI_MAX_RETRIES:
             await asyncio.sleep(GEMINI_RETRY_DELAY * (attempt + 1))
@@ -301,7 +340,9 @@ async def check_reaction_worthy(sender: str, content_text: str) -> str | None:
         log.exception("Не вдалось перевірити доречність незапитаної реакції")
         return None
 
-    return answer if answer in ALLOWED_REACTIONS else None
+    if answer.upper() == "NONE" or not answer:
+        return None
+    return resolve_reaction(answer)
 
 
 async def classify_search_query(text: str, history_snippet: list[dict]) -> str | None:

@@ -40,6 +40,7 @@ from gemini_client import (
     synthesize_speech,
     transcribe_media,
     tts_quota_low,
+    strip_reaction_marker,
 )
 from media_utils import (
     build_reply_media_context,
@@ -418,6 +419,9 @@ async def process_and_reply(
     # Якщо запитували картинку — реакція завжди заборонена, навіть якщо
     # image_urls порожній (не знайшли фото). Модель має відповісти текстом.
     reaction_emoji = parse_reaction_answer(answer) if not image_was_requested else None
+
+    if image_was_requested and not strip_reaction_marker(answer):
+        answer = "Не знайшов нормального фото 😔"
 
     if reaction_emoji:
         chat_history.append(
