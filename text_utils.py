@@ -21,6 +21,24 @@ NAME_PATTERN = re.compile(
 ) if TRIGGER_NAMES else None
 
 
+def build_matcher(words) -> re.Pattern:
+    """Збирає regex для пошуку ключових слів ЦІЛИМИ словами, а не підрядком.
+
+    - "курс"   -> тільки слово «курс» (не «курсор», не «курсова»)
+    - "долар*" -> будь-яке слово, що ПОЧИНАЄТЬСЯ з «долар» (долари, доларів)
+    - фрази з пробілами ("скільки коштує") працюють як є.
+
+    Початок слова перевіряється завжди, тож «пара» більше не ловиться
+    всередині «спарринг» чи «параметри» (для цього «пара» без зірочки)."""
+    parts = []
+    for w in sorted(words, key=len, reverse=True):
+        if w.endswith("*"):
+            parts.append(re.escape(w[:-1]))
+        else:
+            parts.append(re.escape(w) + r"(?!\w)")
+    return re.compile(r"(?<!\w)(?:" + "|".join(parts) + ")", re.IGNORECASE)
+
+
 def wants_forced_voice(text: str) -> bool:
     text_lower = (text or "").lower()
     return any(t in text_lower for t in FORCE_VOICE_TRIGGERS)

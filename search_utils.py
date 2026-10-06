@@ -10,6 +10,7 @@ import time
 import requests
 
 from config import TAVILY_API_KEY
+from text_utils import build_matcher
 
 log = logging.getLogger("Bashma4ek_Bot.search")
 
@@ -17,25 +18,28 @@ log = logging.getLogger("Bashma4ek_Bot.search")
 # Якщо жодного з цих слів немає — LLM взагалі не кликається.
 # Список свідомо вузький: тільки слова, що МАЙЖЕ завжди означають реальний
 # пошук (не "коли підемо гуляти", не "курс лекцій").
+# Формат: "слово" — тільки ціле слово; "слов*" — будь-яке слово з таким початком.
 SEARCH_TRIGGERS = {
     # укр — явні пошукові наміри
-    "знайди", "пошукай", "погугли", "загугли", "новини", "погода", "прогноз",
-    "долар", "євро", "гривня", "злотий",
-    "актуальн", "останні новини", "свіжі новини",
+    "знайди", "пошукай", "погугли", "загугли", "новини", "новину",
+    "погода", "погоду", "погоди", "погоді", "прогноз*",
+    "долар*", "євро", "гривн*", "злот*",
+    "актуальн*", "останні новини", "свіжі новини",
     "скільки коштує", "де знаходиться", "що сталося", "що відбулось",
-    "хто такий", "хто така", "розклад", "результат матч",
+    "хто такий", "хто така", "розклад*", "результат матч*",
     # рос
-    "найди", "поищи", "погугли", "новост", "прогноз погоды",
-    "доллар", "евро", "гривны",
+    "найди", "поищи", "новост*",
+    "доллар*", "евро",
     "последние новости", "свежие новости",
     "сколько стоит", "где находится", "что случилось", "что произошло",
-    "кто такой", "кто такая", "расписание",
+    "кто такой", "кто такая", "расписани*",
     # en / universal
     "search", "google", "find me", "latest news", "current price",
     "who is", "what is", "when did", "how much",
     # польська — для запитів про Польщу
-    "znajdź", "poszukaj", "aktualne", "cena", "kurs",
+    "znajdź", "poszukaj", "aktualn*", "cena", "ceny", "kurs", "kursy",
 }
+_SEARCH_MATCHER = build_matcher(SEARCH_TRIGGERS)
 
 # Слова, що можуть входити до SEARCH_TRIGGERS але в даному контексті майже
 # ніколи не означають реальний пошук — використовуємо як стоп-список
@@ -55,30 +59,30 @@ MAX_FETCH_CHARS = 1500          # символів на результат (бу
 SEARCH_FAILED_MARKER = "__SEARCH_FAILED__"
 
 IMAGE_SEARCH_TRIGGERS = {
-    "покажи", "покажі", "як виглядає", "як виглядають", "фото", "фотку",
-    "картинка", "картинку", "зображення",
+    "покажи", "покажі", "як виглядає", "як виглядають", "фото", "фотк*",
+    "картинк*", "зображенн*",
     "покажи фото", "пришли фото",
-    "как выглядит", "как выглядят", "фотка", "изображение",
+    "как выглядит", "как выглядят", "изображени*",
 }
+_IMAGE_MATCHER = build_matcher(IMAGE_SEARCH_TRIGGERS)
 
 # Ключові слова для новинного запиту
 _NEWS_KEYWORDS = {
-    "новини", "новость", "новости", "новину",
-    "останні", "последние", "latest", "свіжі", "свеж",
+    "новини", "новину", "новость", "новости", "новост*",
+    "останні", "последние", "latest", "свіжі", "свеж*",
     "що сталося", "що відбулось", "что случилось", "что произошло",
     "what happened", "breaking",
 }
+_NEWS_MATCHER = build_matcher(_NEWS_KEYWORDS)
 
 
 def is_image_query(text: str) -> bool:
-    text_lower = (text or "").lower()
-    return any(t in text_lower for t in IMAGE_SEARCH_TRIGGERS)
+    return bool(_IMAGE_MATCHER.search(text or ""))
 
 
 def _is_news_query(query: str) -> bool:
     """Чи схожий запит на новинний? Використовується для Tavily topic=news."""
-    q = (query or "").lower()
-    return any(kw in q for kw in _NEWS_KEYWORDS)
+    return bool(_NEWS_MATCHER.search(query or ""))
 
 
 def _normalize_query(q: str) -> str:
@@ -101,7 +105,7 @@ def needs_web_search(text: str) -> bool:
         if re.search(pat, text_lower):
             return False
 
-    return any(trigger in text_lower for trigger in SEARCH_TRIGGERS)
+    return bool(_SEARCH_MATCHER.search(text_lower))
 
 
 # --- Кеш пошукових запитів (лише текст Tavily) -------------------------------
@@ -128,10 +132,13 @@ def _cache_set(key: str, value: str) -> None:
 
 
 # --- Курс валют (НБП — Народний банк Польщі) --------------------------------
+# «курс» — тільки цілим словом, щоб не ловити «курсор», «курсова» тощо.
 CURRENCY_TRIGGER_WORDS = {
-    "курс", "курси", "курсы", "долар", "доллар", "євро", "евро",
-    "гривня", "гривны", "гривень", "злотий", "злотых", "злотого", "фунт",
+    "курс", "курси", "курсы", "курсу", "курсів", "курсов",
+    "долар*", "доллар*", "євро", "евро",
+    "гривн*", "гривень", "злот*", "фунт*",
 }
+_CURRENCY_MATCHER = build_matcher(CURRENCY_TRIGGER_WORDS)
 
 CURRENCY_KEYWORDS = {
     "USD": ["долар", "доллар", "usd", "$"],
@@ -142,8 +149,7 @@ CURRENCY_KEYWORDS = {
 
 
 def is_currency_query(text: str) -> bool:
-    text_lower = text.lower()
-    return any(w in text_lower for w in CURRENCY_TRIGGER_WORDS)
+    return bool(_CURRENCY_MATCHER.search(text or ""))
 
 
 def detect_currency_codes(text: str) -> list[str]:
@@ -175,7 +181,12 @@ def _currency_sync(codes: list[str]) -> str:
 
 
 # --- Погода (Open-Meteo) -----------------------------------------------------
-WEATHER_TRIGGER_WORDS = {"погода", "погоду", "погоди", "прогноз погоды", "прогноз погоди"}
+# Точні форми, а не «погод*» — інакше ловилось б «погоджуюсь».
+WEATHER_TRIGGER_WORDS = {
+    "погода", "погоду", "погоди", "погоді", "погодою",
+    "прогноз погоды", "прогноз погоди",
+}
+_WEATHER_MATCHER = build_matcher(WEATHER_TRIGGER_WORDS)
 DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "Bytom")
 _WEATHER_STOPWORDS = {
     "сьогодні", "зараз", "завтра", "яка", "буде", "у",
@@ -184,8 +195,7 @@ _WEATHER_STOPWORDS = {
 
 
 def is_weather_query(text: str) -> bool:
-    text_lower = text.lower()
-    return any(w in text_lower for w in WEATHER_TRIGGER_WORDS)
+    return bool(_WEATHER_MATCHER.search(text or ""))
 
 
 def extract_weather_city(text: str) -> str:
@@ -316,7 +326,9 @@ def _tavily_search_sync(
 
 def classify_query(query: str) -> set[str]:
     """Визначає, які спеціалізовані джерела (currency, weather, poland, timetable) потрібні.
-    Tavily тепер підключається не тут, а після LLM-класифікації в get_web_context."""
+    Tavily тепер підключається не тут, а після LLM-класифікації в get_web_context.
+    Також використовується в handlers.process_and_reply, щоб запит про пари/
+    неділі/свята доходив до get_web_context навіть без «пошукових» слів."""
     import poland_utils
     import timetable_utils
 

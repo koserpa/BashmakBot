@@ -6,7 +6,10 @@ import datetime
 import json
 import logging
 import os
+import re
 from zoneinfo import ZoneInfo
+
+from text_utils import build_matcher
 
 log = logging.getLogger("Bashma4ek_Bot.timetable")
 
@@ -131,17 +134,26 @@ def get_schedule(arg: str = "") -> str:
     )
 
 
-_TIMETABLE_KEYWORDS = {
-    "розклад", "расписание", "розкладу", "расписания",
-    "пари", "пары", "пара", "пару", "уроків", "уроков",
-    "plan lekcji", "plany", "lekcje", "lekcji",
-}
+# Цілі слова, а не підрядок: раніше «пара» ловилась у «параметри», «пт» — в «опт» тощо.
+_TIMETABLE_MATCHER = build_matcher({
+    "розклад*", "расписани*",
+    "пари", "пары", "пара", "пару", "пар", "уроків", "уроков",
+    "plan lekcji", "plany", "lekcj*",
+})
 
 
 def is_timetable_query(text: str) -> bool:
     """Чи запитує людина про розклад пар або уроків у звичайному повідомленні."""
-    t = (text or "").lower()
-    return any(w in t for w in _TIMETABLE_KEYWORDS)
+    return bool(_TIMETABLE_MATCHER.search(text or ""))
+
+
+def _find_day_in_text(q: str) -> str | None:
+    """Шукає назву/скорочення дня тижня ЦІЛИМ словом (раніше було `alias in q`,
+    і «пт»/«вт»/«ср» спрацьовували всередині будь-яких слів)."""
+    for alias, key in DAY_ALIASES.items():
+        if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", q):
+            return key
+    return None
 
 
 def get_schedule_context(query: str) -> str:
@@ -153,11 +165,11 @@ def get_schedule_context(query: str) -> str:
 
     q = (query or "").lower()
     # Якщо запитують конкретний день
-    for alias, key in DAY_ALIASES.items():
-        if alias in q:
-            day_data = schedule.get(key)
-            if day_data:
-                return f"\n\n[Розклад занять на {day_data.get('name')}]:\n{format_day_schedule(day_data)}"
+    key = _find_day_in_text(q)
+    if key:
+        day_data = schedule.get(key)
+        if day_data:
+            return f"\n\n[Розклад занять на {day_data.get('name')}]:\n{format_day_schedule(day_data)}"
 
     # За замовчуванням даємо весь актуальний розклад
     lines = ["[Актуальний розклад занять 2TC CosinusYoung15+]:"]

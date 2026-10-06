@@ -5,11 +5,13 @@
 "сирий" контент (question_text) і які додаткові Part-и (фото/відео/файл)
 додаються в запит."""
 import asyncio
+import datetime
 import logging
 import os
 import random
 import time
 from typing import Awaitable, Callable
+from zoneinfo import ZoneInfo
 
 import requests
 from aiogram import Bot, Dispatcher, F
@@ -51,6 +53,7 @@ from media_utils import (
     wav_to_ogg_voice,
 )
 from search_utils import (
+    classify_query,
     get_current_date_str,
     get_web_context,
     is_image_query,
@@ -68,11 +71,22 @@ from text_utils import (
 
 log = logging.getLogger("Bashma4ek_Bot.handlers")
 
+TZ = ZoneInfo("Europe/Warsaw")
+
+# Проактивні повідомлення (idle) — тільки в цьому віконці за варшавським часом,
+# щоб бот не писав о 3 ночі. Можна змінити через env.
+IDLE_ACTIVE_FROM_HOUR = int(os.getenv("IDLE_ACTIVE_FROM", "9"))
+IDLE_ACTIVE_TO_HOUR = int(os.getenv("IDLE_ACTIVE_TO", "22"))
+
+
+def _is_admin_message(message: Message) -> bool:
+    username = (message.from_user.username or "").lstrip("@").lower() if message.from_user else ""
+    return username == ADMIN_USERNAME
+
 
 class IsAdmin(BaseFilter):
     async def __call__(self, message: Message) -> bool:
-        username = (message.from_user.username or "").lstrip("@").lower() if message.from_user else ""
-        return username == ADMIN_USERNAME
+        return _is_admin_message(message)
 
 
 IMAGE_MIME_JPEG = "image/jpeg"
@@ -114,6 +128,9 @@ def was_mentioned(message: Message) -> bool:
 
 
 def get_sender_context(message: Message) -> str:
+    """Контекст про співрозмовника для його ВЛАСНОЇ відповіді. «Чутливе»
+    додається з позначкою «не піднімай», тож модель зачепить його лише
+    якщо людина сама заговорить про це."""
     if not message.from_user or not message.from_user.username:
         return ""
     username = message.from_user.username.lstrip("@").lower()
@@ -131,30 +148,27 @@ def get_sender_context(message: Message) -> str:
     return ""
 
 
-def get_full_context_raw(message: Message) -> str:
-    """Повний контекст (style + sensitive) без обмежень — для приколів типу /gadalka."""
-    if not message.from_user or not message.from_user.username:
-        return ""
-    return get_full_context_raw_by_username(message.from_user.username)
-
-
-def get_full_context_raw_by_username(username: str) -> str:
-    """Те саме що get_full_context_raw, але за голим username (коли Message
-    людини під рукою немає — напр. для absence-детектора)."""
+def get_public_context_by_username(username: str) -> str:
+    """ПУБЛІЧНИЙ профіль людини (лише style, без поля sensitive). Використовується
+    скрізь, де бот пише в загальний чат щось про людину: /gadalka,
+    absence-підкол, згадки через @. Чутливе в загальний чат не потрапляє."""
     for known_username, ctx in USER_CONTEXT.items():
         if known_username.lower() == (username or "").lower():
             if isinstance(ctx, dict):
-                parts = [ctx.get("style", "")]
-                if ctx.get("sensitive"):
-                    parts.append(ctx["sensitive"])
-                return " ".join(p for p in parts if p)
+                return ctx.get("style", "")
             return ctx
     return ""
 
 
+def get_public_context(message: Message) -> str:
+    if not message.from_user or not message.from_user.username:
+        return ""
+    return get_public_context_by_username(message.from_user.username)
+
+
 def get_mentioned_users_context(text: str) -> str:
     """Шукає в тексті @згадки відомих учасників (окрім самого бота) і
-    повертає для них контекст із USER_CONTEXT."""
+    повертає для них ПУБЛІЧНИЙ контекст (лише style) із USER_CONTEXT."""
     if not text:
         return ""
 
@@ -165,9 +179,11 @@ def get_mentioned_users_context(text: str) -> str:
     for username in mentioned_usernames:
         if username.lower() == bot_username_lower:
             continue
-        for known_username, context in USER_CONTEXT.items():
+        for known_username in USER_CONTEXT:
             if known_username.lower() == username.lower():
-                blocks.append(f"@{known_username}: {context}")
+                style = get_public_context_by_username(known_username)
+                if style:
+                    blocks.append(f"@{known_username}: {style}")
                 break
 
     if not blocks:
@@ -261,7 +277,7 @@ async def maybe_react_unprompted(bot: Bot, message: Message, sender: str, conten
 
 async def maybe_intervene_drama(bot: Bot, message: Message) -> None:
     """Якщо детектор побачив 'срач' у чаті — генерує одне коротке
-    втручання в стилі бота (не модераторський тон)."""
+    нейтральне втручання (тон — з SYSTEM_PROMPT)."""
     chat_id = message.chat.id
     if not drama_utils.is_drama_happening(chat_id):
         return
@@ -272,12 +288,10 @@ async def maybe_intervene_drama(bot: Bot, message: Message) -> None:
 
     recent_history = list(bot_state.history[chat_id])[-12:]
     prompt = (
-        "У чаті зараз накал — люди сваряться/зʼясовують стосунки. "
-        "Встрянь ОДНИМ коротким реченням у своєму звичному стилі: або "
-        "розряди обстановку жартом, або підколи всіх одразу, не вибираючи "
-        "сторону. НЕ повчай і не проси прямим текстом типу 'заспокойтесь' "
-        "— має звучати як природна репліка живої людини в чаті, а не "
-        "модератора."
+        "[СИСТЕМНЕ]: у чаті зараз накал — люди сваряться. Напиши ОДНЕ коротке "
+        "речення: розряди обстановку легким необразливим жартом або нейтральним "
+        "коментарем. Не вибирай сторону, не повчай і не проси прямо "
+        "'заспокойтесь'."
     )
     contents = recent_history + [{"role": "user", "parts": [{"text": prompt}]}]
 
@@ -300,7 +314,7 @@ async def maybe_intervene_drama(bot: Bot, message: Message) -> None:
 
 async def maybe_poke_absent_user(bot: Bot, message: Message) -> None:
     """Якщо хтось відомий довго мовчить на фоні активного чату — іноді
-    підколює його відсутність."""
+    легко підколює його відсутність (лише за публічним профілем)."""
     chat_id = message.chat.id
     current_user_id = message.from_user.id if message.from_user else 0
 
@@ -316,13 +330,13 @@ async def maybe_poke_absent_user(bot: Bot, message: Message) -> None:
     absence_utils.mark_poked(chat_id, user_id)  # одразу, щоб не задвоїти
 
     days = silence_hours / 24
-    style = get_full_context_raw_by_username(username)
+    style = get_public_context_by_username(username)  # без sensitive
     prompt = (
-        f"{full_name} не писав(-ла) в чаті вже приблизно {days:.1f} дні. "
-        f"Хтось щойно написав у чаті — на фоні цього встав ОДНЕ коротке "
-        f"речення у своєму стилі, де підколюєш відсутність {full_name} "
-        f"(наприклад, як в стилі 'де {full_name.split()[0]}?'), спираючись "
-        f"на його профіль нижче, якщо доречно. Без пояснень, що ти бот.\n"
+        f"[СИСТЕМНЕ]: {full_name} не писав(-ла) в чаті вже приблизно {days:.1f} дні, "
+        f"а хтось щойно написав. Напиши ОДНЕ коротке необразливе речення, яке "
+        f"жартівливо звертає увагу на відсутність {full_name} (наприклад, "
+        f"'де {full_name.split()[0]}?'), за потреби спираючись на профіль нижче. "
+        f"Не чіпай особисте, гроші чи вразливі теми.\n"
         f"[Про {full_name}]: {style}"
     )
 
@@ -368,7 +382,10 @@ async def process_and_reply(
     image_was_requested = is_image_query(question_text)
     full_prompt_text = f"{sender}: {question_text}"
     image_urls: list[str] = []
-    if needs_web_search(question_text) or image_was_requested:
+    # classify_query додано, щоб запити про пари / неділі / свята / валюту /
+    # погоду доходили до get_web_context, навіть якщо в тексті немає
+    # жодного «пошукового» слова.
+    if needs_web_search(question_text) or image_was_requested or classify_query(question_text):
         web_info, image_urls = await get_web_context(
             question_text,
             chat_history=list(chat_history)[-4:],
@@ -424,9 +441,9 @@ async def process_and_reply(
         answer = "Не знайшов нормального фото 😔"
 
     if reaction_emoji:
-        chat_history.append(
-            {"role": "model", "parts": [{"text": f"(відреагував {reaction_emoji})"}]}
-        )
+        # Реакцію НАВМИСНО не пишемо в історію як відповідь моделі: інакше
+        # модель бачить власні "(відреагував ...)" і заганяє себе в цикл,
+        # відповідаючи тільки емодзі.
         try:
             await bot.set_message_reaction(
                 chat_id=message.chat.id,
@@ -493,12 +510,10 @@ async def send_idle_message(bot: Bot, chat_id: int) -> None:
             "parts": [{
                 "text": (
                     f"[СИСТЕМНЕ]: у чаті тиша вже {idle_hours:.0f}+ годин. "
-                    "Напиши щось одне коротке від себе, щоб оживити чат — "
-                    "жарт, провокаційне питання чи коротку думку, за темою "
-                    "останніх повідомлень якщо вони були, у своєму "
-                    "звичному стилі. Рівно 1 речення. Без звернення до "
-                    "когось конкретного і без пояснень, що ти бот, що чат "
-                    "мовчав, чи щось подібне — просто природне повідомлення."
+                    "Напиши ОДНЕ коротке речення, щоб оживити чат — легкий жарт, "
+                    "цікаве питання чи думка за темою останніх повідомлень, якщо "
+                    "вони були. Без звернення до когось конкретного і без "
+                    "згадок про те, що чат мовчав."
                 )
             }],
         }
@@ -516,7 +531,8 @@ async def send_idle_message(bot: Bot, chat_id: int) -> None:
 async def idle_chat_watcher(bot: Bot):
     """Раз на idle_check_interval_sec проходиться по відомих чатах: якщо
     тиша довша за IDLE_HOURS і бот ще не писав за цей період тиші —
-    надсилає одне проактивне повідомлення. У суботу та неділю проактивні
+    надсилає одне проактивне повідомлення. У суботу та неділю, а також
+    поза вікном IDLE_ACTIVE_FROM..IDLE_ACTIVE_TO (за Варшавою) проактивні
     повідомлення вимкнено."""
     idle_hours = float(os.getenv("IDLE_HOURS", "7"))
     idle_check_interval_sec = 15 * 60
@@ -527,6 +543,10 @@ async def idle_chat_watcher(bot: Bot):
 
         if is_weekend():
             continue  # вихідні — бот сам не пише
+
+        hour_now = datetime.datetime.now(TZ).hour
+        if not (IDLE_ACTIVE_FROM_HOUR <= hour_now < IDLE_ACTIVE_TO_HOUR):
+            continue  # ніч/пізній вечір — не будимо людей
 
         for chat_id, last_active in list(bot_state.last_human_activity.items()):
             if bot_state.idle_message_sent.get(chat_id):
@@ -569,7 +589,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
 
     @dp.message(Command("start", "help"))
     async def cmd_start(message: Message):
-        await message.answer(
+        text = (
             "Прівєт, Я Башмак. "
             f"({', '.join(TRIGGER_NAMES)}).\n\n"
             "Для обичних смертних:\n"
@@ -578,13 +598,18 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             "/remind <час> <текст> — поставити нагадування (/remind 15m піти їсти)\n"
             "/reminders — список активних нагадувань у чаті\n"
             "/remind_del <номер> — скасувати нагадування\n"
-            "/gadalka — робе прогноз на основі історії чата і контекста\n\n"
-            "Тільки для адміна:\n"
-            "/reset — очистити пам'ять поточного чату\n"
-            "/status — статус бота (uptime, розмір історії)\n"
-            "/model — інфо про модель та ліміти запитів\n"
-            "/features — які фіча-флаги зараз увімкнено"
+            "/gadalka — робе прогноз на основі історії чата і контекста"
         )
+        # Адмінські команди показуємо тільки адміну.
+        if _is_admin_message(message):
+            text += (
+                "\n\nТільки для адміна:\n"
+                "/reset — очистити пам'ять поточного чату\n"
+                "/status — статус бота (uptime, розмір історії)\n"
+                "/model — інфо про модель та ліміти запитів\n"
+                "/features — які фіча-флаги зараз увімкнено"
+            )
+        await message.answer(text)
 
     @dp.message(Command("reset"), IsAdmin())
     async def cmd_reset(message: Message):
@@ -629,15 +654,15 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
     @dp.message(Command("gadalka"))
     async def cmd_gadalka(message: Message):
         sender = message.from_user.full_name if message.from_user else "Хтось"
-        full_context = get_full_context_raw(message)  # <-- тут, без фільтра
+        context = get_public_context(message)  # лише style, без sensitive
         recent = list(bot_state.history[message.chat.id])[-10:]
 
         prompt = (
-            f"Ти містична гадалка. Зроби коротке (1-2 речення) абсурдно-влучне "
-            f"'передбачення дня' для {sender}, обов'язково зачепивши щось "
-            f"конкретне з профілю (включно з чутливим/особистим) чи недавньої "
-            f"розмови — саме в цьому й прикол.\n"
-            f"[Про людину]: {full_context}\n"
+            f"Зіграй містичну гадалку. Зроби коротке (1-2 речення) смішне, "
+            f"необразливе 'передбачення дня' для {sender}, зачепивши щось "
+            f"конкретне з інтересів у профілі чи з недавньої розмови. "
+            f"Не чіпай гроші, здоров'я чи інші вразливі теми.\n"
+            f"[Про людину]: {context}\n"
             f"[Недавні повідомлення]: {recent}"
         )
         answer = await ask_gemini(
@@ -683,14 +708,17 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         parts = message.text.split(maxsplit=1)
         r_id_str = parts[1] if len(parts) > 1 else ""
         user_id = message.from_user.id if message.from_user else 0
-        username = (message.from_user.username or "").lstrip("@").lower() if message.from_user else ""
-        is_admin = (username == ADMIN_USERNAME)
-        resp = reminder_utils.delete_reminder(message.chat.id, r_id_str, user_id, is_admin)
+        resp = reminder_utils.delete_reminder(
+            message.chat.id, r_id_str, user_id, _is_admin_message(message)
+        )
         await message.reply(resp)
 
-    @dp.message(Command("start", "help", "reset", "status", "model", "features"))
+    # /start і /help обробляє cmd_start (раніше вони дублювалися тут і ніколи
+    # не спрацьовували). Лишилися лише адмінські команди: якщо їх викликає не
+    # адмін — мовчки ігноруємо, а не віддаємо в загальний обробник тексту.
+    @dp.message(Command("reset", "status", "model", "features"))
     async def cmd_denied(message: Message):
-        return  # мовчки ігноруємо чужі спроби викликати адмін-команди
+        return
 
     @dp.message(F.text)
     async def handle_message(message: Message):
