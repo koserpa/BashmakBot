@@ -7,7 +7,7 @@ import re
 import string
 import time
 
-import requests
+import aiohttp
 
 from config import TAVILY_API_KEY
 from text_utils import build_matcher
@@ -158,12 +158,13 @@ def detect_currency_codes(text: str) -> list[str]:
             if any(kw in text_lower for kw in keywords)]
 
 
-def _currency_sync(codes: list[str]) -> str:
+async def _currency_sync(codes: list[str]) -> str:
     codes = codes or ["USD", "EUR"]
     lines = []
     for code in codes:
         try:
-            resp = requests.get(
+            async with aiohttp.ClientSession() as session:
+                resp = await session.get(
                 f"https://api.nbp.pl/api/exchangerates/rates/A/{code}/?format=json",
                 timeout=6,
             )
@@ -213,7 +214,8 @@ def extract_weather_city(text: str) -> str:
 
 def _weather_sync(city: str) -> str:
     try:
-        geo_resp = requests.get(
+        geo_async with aiohttp.ClientSession() as session:
+                resp = await session.get(
             "https://geocoding-api.open-meteo.com/v1/search",
             params={"name": city, "count": 1, "language": "uk"},
             timeout=6,
@@ -226,7 +228,8 @@ def _weather_sync(city: str) -> str:
         found_name = loc.get("name", city)
         country = loc.get("country", "")
 
-        forecast_resp = requests.get(
+        forecast_async with aiohttp.ClientSession() as session:
+                resp = await session.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
                 "latitude": loc["latitude"],
@@ -465,7 +468,8 @@ current_date_str: str = time.strftime("%Y-%m-%d (%A)")
 
 def _fetch_current_date_sync() -> str | None:
     try:
-        resp = requests.get(
+        async with aiohttp.ClientSession() as session:
+                resp = await session.get(
             "https://timeapi.io/api/time/current/zone",
             params={"timeZone": "Europe/Warsaw"},
             timeout=6,

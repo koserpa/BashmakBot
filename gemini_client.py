@@ -52,7 +52,7 @@ ALLOWED_REACTIONS = {
     "🤷", "🤷‍♀", "😡", "🤙",
 }
 
-_gemini_sem = asyncio.Semaphore(2)
+_gemini_sem = asyncio.Semaphore(5)
 
 
 async def ask_gemini(contents, current_date_str):
@@ -92,7 +92,7 @@ def quota_low() -> bool:
     на реальні відповіді користувачам."""
     if not GEMINI_RPD_LIMIT:
         return False
-    return gemini_stats.count_today >= GEMINI_RPD_LIMIT * 0.9  # залишок < 10%
+    return gemini_stats.count_today >= GEMINI_RPD_LIMIT * 0.95  # залишок < 5%
 
 
 _VS16 = "\ufe0f"
@@ -209,8 +209,11 @@ async def _ask_gemini_inner(contents: list, current_date_str: str) -> str:
 
         except errors.ClientError as e:
             if e.code == 429:
-                log.warning("Запит відхилено: ліміт 429 (RESOURCE_EXHAUSTED)")
-                return "Зараз отримую занадто багато запитів 🤯. Зачекай 1-2 хвилини!"
+                retry_after = int(e.headers.get("retry-after", "120"))
+                log.warning(f"Gemini 429 – waiting {retry_after}s")
+                await asyncio.sleep(retry_after)
+                # retry the request (will consume another attempt from the loop)
+                continue
             log.error(f"Помилка Gemini API (ClientError, без повтору): {e}")
             return "Виникла помилка при зверненні до AI 😔"
 

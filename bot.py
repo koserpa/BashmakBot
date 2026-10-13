@@ -5,8 +5,10 @@
 - media_utils.py     — робота з документами/медіа
 - gemini_client.py   — звернення до Gemini API
 - handlers.py        — усі Telegram-хендлери
+- plugins/         — плагінна система (авто-завантаження)
 """
 import asyncio
+import importlib
 import logging
 import os
 
@@ -16,8 +18,9 @@ from aiogram.enums import ParseMode
 from aiohttp import web
 
 import bot_state
-from config import BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL
+from config import BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, ENABLED_PLUGINS
 from handlers import idle_chat_watcher, register_handlers
+from plugins import load_plugins
 from reminder_utils import reminders_watcher
 from search_utils import date_sync_watcher, refresh_current_date
 
@@ -83,6 +86,11 @@ async def main():
 
     register_handlers(dp, bot)
 
+    # Load plugins
+    background_tasks: set = set()
+    loaded = load_plugins(dp, bot, background_tasks)
+    log.info(f"Завантажено плагінів: {loaded}")
+
     await _start_health_server()
 
     await refresh_current_date()  # синхронний перший фетч ще до старту polling
@@ -95,6 +103,10 @@ async def main():
 
     asyncio.create_task(reminders_watcher(bot))
     log.info("Воркер нагадувань запущено")
+
+    # Background watcher tasks
+    for task in background_tasks:
+        task.add_done_callback(lambda t: background_tasks.discard(t))
 
     await dp.start_polling(bot)
 

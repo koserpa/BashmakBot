@@ -1,11 +1,11 @@
 import os
 from dotenv import load_dotenv
- 
+
 load_dotenv()
- 
+
 # Токен бота від @BotFather
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
- 
+
 # Ключ Gemini API (https://aistudio.google.com/apikey) — безкоштовний
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "")
@@ -13,12 +13,12 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "")
 GEMINI_RPD_LIMIT = int(os.getenv("GEMINI_RPD_LIMIT", "0") or "0")
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
- 
+
 TRIGGER_NAMES = [n.strip() for n in os.getenv(
     "TRIGGER_NAMES", ""
 ).split(",") if n.strip()]
- 
-HISTORY_SIZE = int(os.getenv("HISTORY_SIZE", ""))
+
+HISTORY_SIZE = int(os.getenv("HISTORY_SIZE", "100"))
 
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
 TTS_VOICE_NAME = os.getenv("TTS_VOICE_NAME", "Kore")
@@ -34,7 +34,8 @@ USER_CONTEXT = {
             "Костя 16 років, розробник цього бота. Любить спокій і точні, по суті, "
             "відповіді. Жартує по-чорному та іронічному\\постіронічному — якщо він сам "
             "почав жартувати, можна підхопити. Періодично працює на Сподеку з Владом"
-        )
+        ),
+        "sensitive": None
     },
     "gqwqeq": {
         "style": (
@@ -52,7 +53,7 @@ USER_CONTEXT = {
             "Саша 16 років, 3D-аніматор. Малює, дивиться аніме, регоче з "
             "несмішного, любить сперечатися. Відповідай суто російською."
         ),
-        "sensitive": "вчить польську, зараз А1, соромиться цього",
+        "sensitive": "вчить польшку, зараз А1, соромиться цього",
     },
 }
 
@@ -61,6 +62,9 @@ USER_CONTEXT = {
 # Якщо хочеш «живішого» бота — міняй тон тут, в одному місці.
 # УВАГА: якщо на Koyeb задана змінна оточення SYSTEM_PROMPT — вона
 # перекриває цей текст повністю.
+
+# Список плагінів для авто-завантаження (ім'я папки у plugins/)
+ENABLED_PLUGINS = ["action", "hello", "funny"]
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "Ти — Башмак, телеграм-бот у груповому чаті друзів-студентів. "
