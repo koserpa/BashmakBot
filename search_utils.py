@@ -7,7 +7,7 @@ import re
 import string
 import time
 
-import aiohttp
+import requests
 
 from config import TAVILY_API_KEY
 from text_utils import build_matcher
@@ -158,7 +158,7 @@ def detect_currency_codes(text: str) -> list[str]:
             if any(kw in text_lower for kw in keywords)]
 
 
-async def _currency_sync(codes: list[str]) -> str:
+def _currency_sync(codes: list[str]) -> str:
     codes = codes or ["USD", "EUR"]
     lines = []
     for code in codes:
