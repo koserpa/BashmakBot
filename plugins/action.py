@@ -1,40 +1,34 @@
-"""Action plugin: bot fills/reminds via /fill or natural phrase."""
-from aiogram import types
+"""Action plugin: команда /fill ставить нагадування (синонім /remind).
+
+Раніше тут був ще "природний" тригер за словами «бот»/«в »/«через» —
+він містив латинські літери в слові «наповни» і перехоплював майже будь-яке
+повідомлення з цими словами, тому його прибрано."""
 from aiogram.filters import Command
 from aiogram.types import Message
+
 from reminder_utils import add_reminder
+
 
 async def cmd_fill(message: Message):
     text = message.text[len("/fill"):].strip() if message.text else ""
+    # на випадок /fill@BotName
+    if text.startswith("@"):
+        text = text.split(maxsplit=1)[1] if " " in text else ""
     if not text:
-        await message.reply("Напиши що нагадати, наприклад: /fill виключи газ через 15 хв")
+        await message.reply("Напиши що нагадати, наприклад: /fill 15m виключи газ")
         return
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    mention = f"@{message.from_user.username}" if message.from_user.username else ""
-    res = add_reminder(chat_id, user_id, mention, text)
-    await message.reply(f"⏰ Нагадую: {text}\n{res}")
 
-async def cmd_fill_natural(message: Message):
-    txt = message.text or ""
-    low = txt.lower()
-    if ("напovни" in low or ("бот" in low and ("вик" in low or "через" in low or "в " in low))):
-        # extract after keyword
-        for kw in ("напovни", "бот"):
-            if kw in low:
-                rest = txt.split(kw, 1)[1].strip()
-                if rest:
-                    chat_id = message.chat.id; user_id = message.from_user.id
-                    mention = f"@{message.from_user.username}" if message.from_user.username else ""
-                    res = add_reminder(chat_id, user_id, mention, rest)
-                    await message.reply(f"⏰ Нагадую: {rest}\n{res}")
-                    return
+    user = message.from_user
+    user_id = user.id if user else 0
+    mention = f"@{user.username}" if user and user.username else (user.full_name if user else "Хтось")
 
-from aiogram.filters import Command as C
+    res = add_reminder(message.chat.id, user_id, mention, text)
+    await message.reply(res)
+
 
 def register_handlers(dp):
-    dp.message.register(cmd_fill, C("fill"))
-    dp.message.register(cmd_fill_natural, lambda msg: isinstance(msg, Message) and ("напovни" in (msg.text or "").lower() or ("бот" in (msg.text or "").lower() and ("вик" in (msg.text or "").lower() or "через" in (msg.text or "").lower() or "в " in (msg.text or "").lower()))))
+    dp.message.register(cmd_fill, Command("fill"))
+
 
 def register_watchers(bot, tasks):
     pass

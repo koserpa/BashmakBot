@@ -8,7 +8,6 @@
 - plugins/         — плагінна система (авто-завантаження)
 """
 import asyncio
-import importlib
 import logging
 import os
 
@@ -18,7 +17,7 @@ from aiogram.enums import ParseMode
 from aiohttp import web
 
 import bot_state
-from config import BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, ENABLED_PLUGINS
+from config import BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL
 from handlers import idle_chat_watcher, register_handlers
 from plugins import load_plugins
 from reminder_utils import reminders_watcher
@@ -81,15 +80,18 @@ async def main():
     dp = Dispatcher()
 
     me = await bot.get_me()
-    bot_state.set_bot_identity(me.id, me.username, me.full_name) # type: ignore
+    bot_state.set_bot_identity(me.id, me.username, me.full_name)  # type: ignore
     log.info(f"Бот авторизований як @{me.username} (id={me.id})")
 
-    register_handlers(dp, bot)
-
-    # Load plugins
+    # ВАЖЛИВО: плагіни реєструємо ПЕРЕД основними хендлерами. aiogram бере
+    # перший хендлер, що підійшов, а загальний @dp.message(F.text) ловить
+    # будь-який текст (включно з командами) — тому всі плагінні команди
+    # (/joke, /hello, /fill) мають бути зареєстровані раніше.
     background_tasks: set = set()
     loaded = load_plugins(dp, bot, background_tasks)
     log.info(f"Завантажено плагінів: {loaded}")
+
+    register_handlers(dp, bot)
 
     await _start_health_server()
 

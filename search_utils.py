@@ -163,9 +163,9 @@ def _currency_sync(codes: list[str]) -> str:
     lines = []
     for code in codes:
         try:
-            async with aiohttp.ClientSession() as session:
-                resp = await session.get(
-                f"https://api.nbp.pl/api/exchangerates/rates/A/{code}/?format=json",
+            resp = requests.get(
+                f"https://api.nbp.pl/api/exchangerates/rates/A/{code}/",
+                params={"format": "json"},
                 timeout=6,
             )
             resp.raise_for_status()
@@ -214,8 +214,7 @@ def extract_weather_city(text: str) -> str:
 
 def _weather_sync(city: str) -> str:
     try:
-        geo_async with aiohttp.ClientSession() as session:
-                resp = await session.get(
+        geo_resp = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
             params={"name": city, "count": 1, "language": "uk"},
             timeout=6,
@@ -228,8 +227,7 @@ def _weather_sync(city: str) -> str:
         found_name = loc.get("name", city)
         country = loc.get("country", "")
 
-        forecast_async with aiohttp.ClientSession() as session:
-                resp = await session.get(
+        forecast_resp = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
                 "latitude": loc["latitude"],
@@ -468,8 +466,7 @@ current_date_str: str = time.strftime("%Y-%m-%d (%A)")
 
 def _fetch_current_date_sync() -> str | None:
     try:
-        async with aiohttp.ClientSession() as session:
-                resp = await session.get(
+        resp = requests.get(
             "https://timeapi.io/api/time/current/zone",
             params={"timeZone": "Europe/Warsaw"},
             timeout=6,
