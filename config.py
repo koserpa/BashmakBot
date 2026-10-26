@@ -28,6 +28,38 @@ TTS_RPD_LIMIT = int(os.getenv("TTS_RPD_LIMIT", "10"))
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "koserpa").lstrip("@").lower()
 
+# ------------------------------------------------------------------
+# Dziennik VULCAN (вебверсія, у т.ч. Bytom) — реальний розклад учня.
+#
+# Як отримати VUL_COOKIES: див. докстрінг у vulcan_utils.py та хелпер
+# get_vulcan_cookies.py. Це секрет (cookie сесії) — ніколи не комітьте
+# його в репозиторій і не пишіть у логи.
+#
+# VULCAN_BASE — корінь порталу учня вашого регіону (місто в URL).
+# VULCAN_COOKIES — "name=value; name2=value2" (сession cookies порталу
+#   учня після ручного входу). Порожньо = фіча вимкнена (бот тоді
+#   повідомляє, що розклад недоступний).
+# VULCAN_LOGIN / VULCAN_PASSWORD — облікові дані учня для АВТО-логіну,
+#   коли сесію протухло (vulcan_autologin.py; чистий HTTP). Якщо задані,
+#   бот сам відновлює сесію. Це СЕКРЕТИ: Koyeb -> Environment Variables
+#   (Secrets), локально -- .env; у логи/чат не потрапляють.
+# VULCAN_AUTOLOGIN_COOLDOWN_MIN — мінімальний інтервал між спробами
+#   авто-логіну (щоб не бомбардувати портало при невірних даних).
+# VULCAN_TTL_MINUTES — скільки кешується відповідь про розклад.
+# VULCAN_KEEPALIVE_MINUTES — як часто (поки бот живий) мовчки оновлювати
+#   сесію, щоб cookies не протухли за час простою. 0 = вимкнути.
+# ------------------------------------------------------------------
+VULCAN_COOKIES = os.getenv("VULCAN_COOKIES", "")
+VULCAN_BASE = os.getenv("VULCAN_BASE", "https://dziennik-uczen.vulcan.net.pl/bytom")
+VULCAN_TTL_MINUTES = int(os.getenv("VULCAN_TTL_MINUTES", "30") or "30")
+VULCAN_KEEPALIVE_MINUTES = int(os.getenv("VULCAN_KEEPALIVE_MINUTES", "20") or "20")
+VULCAN_UA = os.getenv("VULCAN_UA", "Mozilla/5.0 (compatible; personal student timetable reader)")
+VULCAN_LOGIN = os.getenv("VULCAN_LOGIN", "").strip()
+VULCAN_PASSWORD = os.getenv("VULCAN_PASSWORD", "")
+VULCAN_AUTOLOGIN_COOLDOWN_MIN = int(
+    os.getenv("VULCAN_AUTOLOGIN_COOLDOWN_MIN", "60") or "60"
+)
+
 USER_CONTEXT = {
     "koserpa": {
         "style": (
@@ -64,7 +96,7 @@ USER_CONTEXT = {
 # перекриває цей текст повністю.
 
 # Список плагінів для авто-завантаження (ім'я папки у plugins/)
-ENABLED_PLUGINS = ["action", "hello", "funny"]
+ENABLED_PLUGINS = ["action", "hello", "funny", "vulcan"]
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "Ти — Башмак, телеграм-бот у груповому чаті друзів-студентів. "

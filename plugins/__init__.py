@@ -31,7 +31,7 @@ def load_plugins(dp, bot, background_tasks=None):
                 mod.register_handlers(dp)
                 log.info(f"Plugin '{name}': handlers registered")
             # Register watchers (background tasks)
-            if hasattr(mod, "register_watchers") and background_tasks:
+            if hasattr(mod, "register_watchers") and background_tasks is not None:
                 mod.register_watchers(bot, background_tasks)
                 log.info(f"Plugin '{name}': watchers registered")
             loaded.append(name)

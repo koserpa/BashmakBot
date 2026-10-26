@@ -6,6 +6,8 @@ import os
 import re
 import string
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -13,6 +15,8 @@ from config import TAVILY_API_KEY
 from text_utils import build_matcher
 
 log = logging.getLogger("Bashma4ek_Bot.search")
+
+_TZ = ZoneInfo("Europe/Warsaw")
 
 # --- Грубі тригери — перший бар'єр (без витрат квоти) ----------------------
 # Якщо жодного з цих слів немає — LLM взагалі не кликається.
@@ -325,13 +329,20 @@ def _tavily_search_sync(
     return text_result, image_urls
 
 
+# Запити про розклад/пари розпізнаємо простим регексом (замість
+# статичного timetable_utils, якого більше не існує).
+_TIMETABLE_QUERY_RE = re.compile(
+    r"розклад|расписан|\bпари\b|\bурок\w*|\bschedule\b|учнів|занять|\bплан\b",
+    re.IGNORECASE,
+)
+
+
 def classify_query(query: str) -> set[str]:
     """Визначає, які спеціалізовані джерела (currency, weather, poland, timetable) потрібні.
     Tavily тепер підключається не тут, а після LLM-класифікації в get_web_context.
     Також використовується в handlers.process_and_reply, щоб запит про пари/
     неділі/свята доходив до get_web_context навіть без «пошукових» слів."""
     import poland_utils
-    import timetable_utils
 
     categories: set[str] = set()
     if is_currency_query(query):
@@ -340,7 +351,7 @@ def classify_query(query: str) -> set[str]:
         categories.add("weather")
     if poland_utils.is_poland_calendar_query(query):
         categories.add("poland")
-    if timetable_utils.is_timetable_query(query):
+    if _TIMETABLE_QUERY_RE.search(query):
         categories.add("timetable")
     return categories
 
@@ -361,7 +372,6 @@ async def get_web_context(
     # Lazy import — уникаємо циклу на рівні модулів
     from gemini_client import classify_search_query
     import poland_utils
-    import timetable_utils
 
     want_images = is_image_query(query)
     chat_history = chat_history or []
@@ -387,9 +397,36 @@ async def get_web_context(
             parts.append(poland_info)
 
     if "timetable" in categories:
-        timetable_info = await asyncio.to_thread(timetable_utils.get_schedule_context, query)
-        if timetable_info:
-            parts.append(timetable_info)
+        # РЕАЛЬНИЙ розклад з Dziennik VULCAN (не статичний!).
+        # Витягуємо з питання конкретну дату ("розклад на цю середу",
+        # "розклад 2.11"), інакше показуємо сьогодні+завтра.
+        try:
+            import vulcan_utils
+            from plugins.vulcan import _target_from_arg
+            from datetime import date as _date, timedelta as _td
+
+            arg = ""
+            m = re.search(
+                r"(?:розклад|расписан|план|schedule)[a-zа-яіїєґ]*\s*(?:на|у|via|в|za|w|на|for)?\s*(.{0,40})",
+                query, re.IGNORECASE,
+            )
+            if m:
+                arg = m.group(1)
+            parsed = _target_from_arg(arg) if arg else None
+            if isinstance(parsed, _date):
+                targets = [parsed]
+            else:
+                base = datetime.now(_TZ).date()
+                targets = [base, base + _td(days=1)]
+            for t in targets:
+                try:
+                    status, text = await vulcan_utils.schedule_text(t)
+                except vulcan_utils.VulcanDisabled:
+                    break
+                if status == "ok":
+                    parts.append(text)
+        except Exception as e:  # noqa: BLE001 — контекст не критичний
+            log.warning(f"timetable context (VULCAN): {e}")
 
     # --- Tavily: двоступеневий фільтр ---
     # Для картинок LLM-класифікацію пропускаємо — тригер вже спрацював

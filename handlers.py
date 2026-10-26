@@ -24,7 +24,6 @@ import absence_utils
 import bot_state
 import drama_utils
 import reminder_utils
-import timetable_utils
 from config import ADMIN_USERNAME, GEMINI_MODEL, GEMINI_RPD_LIMIT, TRIGGER_NAMES, USER_CONTEXT
 from features import (
     REACT_UNPROMPTED_CHANCE,
@@ -594,7 +593,10 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             f"({', '.join(TRIGGER_NAMES)}).\n\n"
             "Для обичних смертних:\n"
             "/help — цей список команд\n"
-            "/rozklad [день] — розклад пар 2TC (сьогодні/завтра/день/тиждень)\n"
+            "/rozklad [сьогодні|завтра|післязавтра|день тижня|дата] — реальний розклад 2TC з VULCAN (дата: 2.11, «2 листопада», через N днів)\n"
+            "/rozklad тиждень — тижневий огляд (пн-нд)\n"
+            "«розклад ...» текстом (без слеша) теж працює\n"
+            "/rozklad_status — стан сесії VULCAN\n"
             "/remind <час> <текст> — поставити нагадування (/remind 15m піти їсти)\n"
             "/reminders — список активних нагадувань у чаті\n"
             "/remind_del <номер> — скасувати нагадування\n"
@@ -671,15 +673,8 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         )
         await message.reply(f"🔮 {answer}")
 
-    @dp.message(Command("rozklad", "schedule"))
-    async def cmd_rozklad(message: Message):
-        arg = ""
-        if message.text:
-            parts = message.text.split(maxsplit=1)
-            if len(parts) > 1:
-                arg = parts[1]
-        resp = timetable_utils.get_schedule(arg)
-        await message.reply(resp)
+    # /rozklad та /rozklad_* обробляє плагін vulcan (реальний розклад
+    # із Dziennik VULCAN); тут статичного фолбеку більше немає.
 
     @dp.message(Command("remind"))
     async def cmd_remind(message: Message):
