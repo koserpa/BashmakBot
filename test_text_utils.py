@@ -5,6 +5,13 @@
 """
 from __future__ import annotations
 
+import os
+
+# Детермінованість: на CI немає .env, а TRIGGER_NAMES читається в config.py
+# при імпорті. Задаємо імена ДО імпорту text_utils/config, щоб тести не
+# залежали від оточення (локального .env).
+os.environ["TRIGGER_NAMES"] = "Башмак,Башмачок"
+
 import sys
 import time
 
