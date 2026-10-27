@@ -17,6 +17,7 @@ from aiogram.enums import ParseMode
 from aiohttp import web
 
 import bot_state
+import tasks
 from config import BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL
 from handlers import idle_chat_watcher, register_handlers
 from plugins import load_plugins
@@ -96,20 +97,18 @@ async def main():
     await _start_health_server()
 
     await refresh_current_date()  # синхронний перший фетч ще до старту polling
-    asyncio.create_task(date_sync_watcher())
+    tasks.spawn_watch("date_sync", lambda: date_sync_watcher())
     log.info("Синхронізація дати з інтернетом запущена (кожні 8г)")
 
-    asyncio.create_task(idle_chat_watcher(bot))
+    tasks.spawn_watch("idle_chat", lambda: idle_chat_watcher(bot))
     idle_hours = float(os.getenv("IDLE_HOURS", "7"))
     log.info(f"Спостерігач за тишею в чаті запущено (поріг {idle_hours}г)")
 
-    asyncio.create_task(reminders_watcher(bot))
+    tasks.spawn_watch("reminders", lambda: reminders_watcher(bot))
     log.info("Воркер нагадувань запущено")
 
-    # Background watcher tasks
-    for task in background_tasks:
-        task.add_done_callback(lambda t: background_tasks.discard(t))
-
+    # Background watcher tasks: тепер усі живуть у tasks.WATCHERS під
+    # супервізором (фоновий цикл впав — сам задовбався, лог у Koyeb).
     await dp.start_polling(bot)
 
 

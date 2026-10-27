@@ -12,6 +12,9 @@ import sys
 class FakeMessage:
     def __init__(self, text: str):
         self.text = text
+        # для vulcan_notify.remember_chat (тест-чат, не впливає на бота)
+        from types import SimpleNamespace
+        self.chat = SimpleNamespace(id=0)
 
     async def reply(self, txt: str, **kwargs):
         print("----------reply----------")

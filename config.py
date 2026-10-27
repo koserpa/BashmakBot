@@ -59,6 +59,23 @@ VULCAN_PASSWORD = os.getenv("VULCAN_PASSWORD", "")
 VULCAN_AUTOLOGIN_COOLDOWN_MIN = int(
     os.getenv("VULCAN_AUTOLOGIN_COOLDOWN_MIN", "60") or "60"
 )
+# VULCAN_NOTIFY_CHATS — кому кидати проактивні сповіщення VULCAN
+# (заміни/відміни; нагадування за день до sprawdzianu/дз).
+# Список chat_id через кому. Порожньо = бот сам запам'ятає чати,
+# де хтось користувався розкладом.
+VULCAN_NOTIFY_CHATS = [
+    s.strip() for s in os.getenv("VULCAN_NOTIFY_CHATS", "").split(",") if s.strip()
+]
+# VULCAN_CHANGES_POLL_MIN — як часто перевіряти розклад на нові заміни (хв).
+VULCAN_CHANGES_POLL_MIN = int(os.getenv("VULCAN_CHANGES_POLL_MIN", "15") or "15")
+# VULCAN_REMIND_HOUR — година (Варшава) вечірнього нагадування про завтрашні
+# sprawdziany/картківки/дз. Немає завтрашніх подій -> повідомлення не шлється.
+VULCAN_REMIND_HOUR = int(os.getenv("VULCAN_REMIND_HOUR", "18") or "18")
+# VULCAN_MORNING_HOUR/MINUTE — ранковий дайджест «розклад на сьогодні» (Варшава).
+VULCAN_MORNING_HOUR = int(os.getenv("VULCAN_MORNING_HOUR", "6") or "6")
+VULCAN_MORNING_MINUTE = int(os.getenv("VULCAN_MORNING_MINUTE", "50") or "50")
+# VULCAN_NOTIFY=false — вимкнути проактивні сповіщення (тіпа mute для всього бота).
+VULCAN_NOTIFY_ENABLED = os.getenv("VULCAN_NOTIFY", "true").strip().lower() != "false"
 
 USER_CONTEXT = {
     "koserpa": {

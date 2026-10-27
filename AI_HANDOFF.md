@@ -38,11 +38,11 @@ $env:PYTHONIOENCODING="utf-8"; & "$env:LOCALAPPDATA\Programs\Python\Python313\py
 
 ### Точка входу `bot.py`
 - aiogram polling + **health-check HTTP-сервер на порту 8000** (`/` та `/health`) — потрібен для Koyeb.
-- Фонові воркери:
-  - `keepalive` Vulcan (кожні `VULCAN_KEEPALIVE_MINUTES`=20хв);
-  - синхронізація дати з інтернету (кожні 8г, для відповідей "який сьогодні день");
-  - watcher тиші в чаті (поріг 7г);
-  - воркер нагадувань.
+- Фонові воркери — УСІ під супервізором `tasks.py` (`spawn_watch(name, factory)`):
+  впав цикл → лог з traceback → авто-перезапуск з бектрафом (10с→20с→…→кап 5хв);
+  >5 падінь/добу → супервізор сам зупиняється. Живі watcher-х видно в
+  **`/status`** (адмін): uptime, Gemini RPD, TTS RPD, чатів у памʼяті, циклі:
+  `date_sync`, `idle_chat`, `reminders`, `vulcan_notify` (або `vulcan_keepalive`).
 - Плагіни завантажуються з `plugins/`, список — `ENABLED_PLUGINS` у `config.py`
   (зараз: `action`, `hello`, `funny`, `vulcan`).
 
@@ -50,6 +50,8 @@ $env:PYTHONIOENCODING="utf-8"; & "$env:LOCALAPPDATA\Programs\Python\Python313\py
 - `vulcan.py` — команди розкладу: `/rozklad` (на завтра/дату), `/rozklad тиждень`;
   тригери текстом: укр "розклад", рос "расписание"/"план", англ "schedule";
   префікси "Бот ..."/"Башмак ..."; обгортки "на цю середу", "наступну п'ятницю" парсяться.
+  **Кнопки**: під карткою дня/тижня inline-кнопки (завтра/тиждень/sprawdziany),
+  callback-хендлер `on_vulcan_callback` ловить `vulcan:*`.
 - `hello.py`, `funny.py`, `action.py` — дрібні розваги/привітання.
 
 ### Головний чат (Gemini)
@@ -119,6 +121,51 @@ $env:PYTHONIOENCODING="utf-8"; & "$env:LOCALAPPDATA\Programs\Python\Python313\py
 - Авто-логін оновлює куки **тільки в пам'яті** (не пише назад у `.env`) — навмисно,
   Koyeb все одно ephemeral.
 
+### Проактивні сповіщення — `vulcan_notify.py` (жовтень 2026)
+Одна фаза (`notify_watcher`, стартує з `plugins/vulcan.py.register_watchers`) —
+і сам цикл ТРИМАЄ СЕСІЮ ЖИВОЮ (кожна ітерація = запит до API), тому окремий
+keepalive_watcher не стартує, коли notify увімкнено (`VULCAN_NOTIFY=false`
+повертає класичний keepalive):
+1. **Зміни розкладу**: кожні `VULCAN_CHANGES_POLL_MIN` хв (default 15) тягнемо
+   `PlanZajec` на 7 днів **force=True**, diff підписів (`lesson_signature`:
+   відміна+причина, заміни вчителя/сали, примітки) проти снапшоту
+   `data/vulcan_notify.json`. Перша кадровка = тихий baseline.
+   **Нічна пауза 00:00–06:00** (Варшава) — цикли пропускаються.
+2. **Ранковий дайджест** (`VULCAN_MORNING_HOUR:MINUTE`, default 6:50):
+   розклад на сьогодні + події сьогодні, раз на день (`morning_done_day`).
+3. **За день до події**: після `VULCAN_REMIND_HOUR` (default 18) тягнемо
+   `/api/SprawdzianyZadaniaDomowe` на завтра: typ=1 → "🧪 Sprawdzian",
+   typ=2 → "📖 Zadanie domowe", typ=3 → "📝 Kartkówka" (розвідка 27.10:
+   у живих даних є typ 1/2/3/4; typ 4 поки «Подія (typ 4)» — перевірити
+   в Portal UI який це род). Ids сповіщених зберігаються з ДАТОЮ сповіщення
+   та чистяться при _save() (TTL 35 днів, `NOTIFIED_TTL_DAYS`) —
+   рестарти не спам знову, state не розростається.
+4. **`/sprawdziany`** (публічний API `upcoming_events_text(days=30)`) —
+   всі події на 30 днів, групування по датах. Текстові тригери БЕЗ слеша:
+   регес `plugins/vulcan.py`: «Бот кинь справдзіани», «шо по дз»,
+   «що по домашці», просто «справдзіани» — ловиться `_TEXT_SPZ_RE`.
+5. **`/vulcan_silence`** (alias `/vulcan_mute`) — toggle-тишина для чату
+   (`muted_chats`); mutнути чати НЕ реєструються в цілі повторно.
+6. Цілі-чати: env `VULCAN_NOTIFY_CHATS` (через кому) АБО чати, де використовували
+   розклад/sprawdziany (авто-запам'ятовування). **Мертві чати**: 10 послідовних
+   невдалих send'ів (`fail_counts`) → авто-виключення зі списку цілей.
+
+### Живі API-ендпоінти вебпорталу (програв маршрут Chrome, 27.10.2026)
+```
+GET /api/Context                                   -> учень/ключ
+GET /api/PlanZajec?key&dataOd&dataDo&zakresDanych=2 -> розклад (item.zmiany = заміни)
+GET /api/DniWolne?key&dataOd&dataDo                -> свята
+GET /api/SprawdzianyZadaniaDomowe?key&dataOd&dataDo -> sprawdziany + дз!
+     (item: {typ: 1|2, przedmiotNazwa, data, hasAttachment, id})
+GET /api/*Tablica (SprawdzianyTablica, ZadaniaDomoweTablica, WazneDzisiaj...) -> тільки "сьогодні"
+```
+Всі ендпоінти GET+query, утилізуються з кукі сесії; невідомий шлях сервер віддає
+**200 text/html** (SPA fallback) — при розвідці ловився як VulcanAuthError.
+`SprawdzianyZadaniaDomowe` товаришується зі `key` учня; діапазон дат — UTC ISO
+-кила `_iso_range_start/_iso_range_end`. Деталі (opis/zakres) НЕ в списку —
+тільки предмет+дата+typ; якщо колись потрібен opis, шукати нове в JS-профілі.
+Дам же, щоб дивитись події на UI: вкладка «Sprawdziany i zadania domowe».
+
 ---
 
 ## 5. Env-змінні (.env / Koyeb Secrets)
@@ -128,6 +175,8 @@ $env:PYTHONIOENCODING="utf-8"; & "$env:LOCALAPPDATA\Programs\Python\Python313\py
 | `BOT_TOKEN` | токен Telegram-бота |
 | `GEMINI_API_KEY`, `GEMINI_MODEL` | LLM чат |
 | `GEMINI_RPD_LIMIT`, `TTS_RPD_LIMIT` | денні ліміти |
+| `GEMINI_MAX_OUTPUT` | ліміт output-токенів відповіді (1024); у thinking-моделях роздуми теж їдять ліміт — при обрізаних відповідях підняти на 2048+ |
+| `GEMINI_FALLBACK_MODEL` | запасна модель на останній retry |
 | `TAVILY_API_KEY` | інтернет-пошук |
 | `VULCAN_COOKIES` | куки сесії порталу учня (можуть протухнути — це ОК, авто-логін оновить) |
 | `VULCAN_BASE` | `https://dziennik-uczen.vulcan.net.pl/bytom` |
@@ -135,6 +184,11 @@ $env:PYTHONIOENCODING="utf-8"; & "$env:LOCALAPPDATA\Programs\Python\Python313\py
 | `VULCAN_AUTOLOGIN_COOLDOWN_MIN` | cooldown між спробами авто-логіну (60) |
 | `VULCAN_KEEPALIVE_MINUTES` | період keepalive (20) |
 | `VULCAN_UA` | UA для API-запитів |
+| `VULCAN_NOTIFY_CHATS` | chat_id (через кому) для проактивних сповіщень; порожньо = чати, де юзали /rozklad |
+| `VULCAN_CHANGES_POLL_MIN` | період перевірки замін у розкладі (15); ніч 00:00–06:00 — пауза |
+| `VULCAN_REMIND_HOUR` | година (Варшава) нагадування про завтрашні sprawdzian/дз (18) |
+| `VULCAN_MORNING_HOUR[_MINUTE]` | ранковий дайджест «розклад на сьогодні» (6:50) |
+| `VULCAN_NOTIFY` | `false` — вимкнути всі проактивні сповіщення (штатний keepalive повертається) |
 | `PORT` | порт health-сервера (8000) |
 | `ADMIN_USERNAME` | `koserpa` |
 | `TRIGGER_NAMES` | імена-тригери бота |
@@ -166,8 +220,23 @@ $env:PYTHONIOENCODING="utf-8"; & "$env:LOCALAPPDATA\Programs\Python\Python313\py
 - Відмінені уроки: `<s>закреслені</s>` ( Emblem ❌ прибрали, заміна — текстова помітка).
 - Помилки: "⚠️ VULCAN недоступний — спробуй через хвилину".
 
-## 8. Стан на зараз (2026-10-26)
+## 8. Стан на зараз
 
-- Все працює **live з реальними даними**: авто-логін → сесія → реальний розклад на завтра.
-- Бот зупинено процесом по запиту користувача; Койеб-деплой з новими секретами ще не зроблено (чекліт у §6).
-- Тимчасові дебаг-скрипти видалено; у репо лишились тільки тест-файли.
+- Авто-логін працює live; всі тести зелені (test_vulcan_notify / _autologin / _utils,
+  smoke_test_plugins). GitHub Actions (`.github/workflows/tests.yml`) гоняє
+  оффлайн-тести на кожен пуш.
+- НОВЕ (27.10.2026): проактивні сповіщення `vulcan_notify.py` — заміни/відміни
+  (diff розкладу кожні 15хв, ніч 00:00–06:00 пауза) + нагадування за день до
+  sprawdzian/дз (18:00) + ранковий дайджест (6:50) + `/sprawdziany` (текстові
+  тригери «шо по дз» тощо) + `/vulcan_silence`. Цикл об'єднано з keepalive
+  (менше запитів до порталу). Live-тест пройдено.
+- НОВЕ (27.10.2026, вечір): typ=3 розпізнається як «📝 Kartkówка» (живі дані
+  мають typ 1/2/3/4; typ 4 поки генерик — звірити з Portal UI коли трапиться);
+  state-чистка `notified_events` (дата замість true, TTL 35 днів у `_save`);
+  inline-кнопки під розкладом одень/тижден (@callback `vulcan:*`).
+- НОВЕ (27.10.2026, не-vulcan): супервізор фонових циклів `tasks.py`
+  (авто-перезапуск впалых watcher-ів, реєстр `WATCHERS` → видно в `/status`);
+  `GEMINI_MAX_OUTPUT` (env, default 1024 — thinking-токени теж лімітовані);
+  безпечний parse retry-after (429, кап 90с); /status розширено (квоти, чати,
+  живі циклі); reminder-parser приймає кириличні «30м/45с/2 днів» (був тьхий
+  bug: «днів» давав 0); оффлайн-тести `test_text_utils.py` (у CI теж).

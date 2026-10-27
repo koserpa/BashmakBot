@@ -27,7 +27,9 @@ from zoneinfo import ZoneInfo
 
 from aiogram import F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import (
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+)
 
 import vulcan_utils
 
@@ -213,6 +215,15 @@ def _target_from_arg(arg: str) -> date | None | str:
     return _parse_date_arg(arg)
 
 
+def _schedule_kb() -> InlineKeyboardMarkup:
+    """Кнопки під карткою розкладу: сусідні види огляду — в один тап."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⏭ Завтра", callback_data="vulcan:jutro"),
+        InlineKeyboardButton(text="📅 Тиждень", callback_data="vulcan:tydzien"),
+        InlineKeyboardButton(text="🧪 Sprawdziany", callback_data="vulcan:sprz"),
+    ]])
+
+
 async def _reply_day(message: Message, target: date) -> bool:
     """Відправити розклад на день. False = VULCAN не доступний/не налаштований."""
     if not _vulcan_enabled():
@@ -221,6 +232,10 @@ async def _reply_day(message: Message, target: date) -> bool:
 
     try:
         status, text = await vulcan_utils.schedule_text(target)
+        if status == "ok":
+            # чат «бачив» розклад -> цінна ціль для проактивних сповіщень
+            import vulcan_notify
+            vulcan_notify.remember_chat(message.chat.id)
     except vulcan_utils.VulcanDisabled:
         await message.reply(
             "🔐 <b>VULCAN не підключено</b>: змінна <code>VULCAN_COOKIES</code> не задана.\n"
@@ -233,7 +248,7 @@ async def _reply_day(message: Message, target: date) -> bool:
             "⚠️ <b>VULCAN недоступний</b> — не зміг дістати розклад.\n"
             "Спробуй через хвилину."
         )
-    await message.reply(text)
+    await message.reply(text, reply_markup=_schedule_kb())
     return True
 
 
@@ -277,6 +292,9 @@ async def cmd_rozklad_tydzien(message: Message):
         return
     try:
         status, text = await vulcan_utils.week_text()
+        if status == "ok":
+            import vulcan_notify
+            vulcan_notify.remember_chat(message.chat.id)
     except vulcan_utils.VulcanDisabled:
         await message.reply(
             "🔐 <b>VULCAN не підключено</b>: змінна <code>VULCAN_COOKIES</code> не задана."
@@ -288,7 +306,24 @@ async def cmd_rozklad_tydzien(message: Message):
             "⚠️ <b>VULCAN недоступний</b> — не зміг дістати тижневий розклад.\n"
             "Спробуй через хвилину."
         )
-    await message.reply(text)
+    await message.reply(text + "\n\n<i>⬇ кнопки внизу — сусідні огляди в один тап</i>",
+                        reply_markup=_schedule_kb())
+
+
+async def on_vulcan_callback(cq: CallbackQuery) -> None:
+    """Кнопки під розкладом: 'vulcan:jutro' / 'vulcan:tydzien' / 'vulcan:sprz'."""
+    data = cq.data or ""
+    action = data[len("vulcan:"):]
+    await cq.answer()
+    msg = cq.message
+    if msg is None:            # старе повідомлення стало недоступним
+        return
+    if action == "jutro":
+        await _reply_day(msg, datetime.now(TZ).date() + timedelta(days=1))
+    elif action == "tydzien":
+        await cmd_rozklad_tydzien(msg)
+    elif action == "sprz":
+        await cmd_sprawdziany(msg)
 
 
 async def cmd_rozklad_status(message: Message):
@@ -296,6 +331,48 @@ async def cmd_rozklad_status(message: Message):
     vulcan_state = await vulcan_utils.status_text()
     text = f"<b>Стан джерел розкладу</b>\n{vulcan_state}"
     await message.reply(text)
+
+
+async def cmd_sprawdziany(message: Message):
+    """/sprawdziany (і текстові варіанти «шо по дз») — всі події на 30 днів."""
+    if not _vulcan_enabled():
+        await message.reply("🚫 Розклад вимкнено (VULCAN_ENABLED=false).")
+        return
+    import vulcan_notify
+    try:
+        status, text = await vulcan_notify.upcoming_events_text(30)
+        if status == "ok":
+            vulcan_notify.remember_chat(message.chat.id)
+    except vulcan_utils.VulcanDisabled:
+        await message.reply(
+            "🔐 <b>VULCAN не підключено</b>: змінні <code>VULCAN_COOKIES</code> / "
+            "<code>VULCAN_LOGIN</code> не задані."
+        )
+        return
+    except vulcan_utils.VulcanError as e:
+        log.warning(f"VULCAN (sprawdziany) помилка: {e}")
+        text = "⚠️ <b>VULCAN недоступний</b> — спробуй через хвилину."
+    await message.reply(text)
+
+
+async def cmd_vulcan_silence(message: Message):
+    """/vulcan_silence — увімкнути/вимкнути проактивні сповіщення для чату."""
+    if not _vulcan_enabled():
+        await message.reply("🚫 Розклад вимкнено (VULCAN_ENABLED=false).")
+        return
+    import vulcan_notify
+    muted = vulcan_notify.toggle_mute(message.chat.id)
+    if muted:
+        await message.reply(
+            "🔇 <b>Тишину включено</b> — заміни, sprawdziany й ранкові дайджести "
+            "в цей чат більше не приходять.\n"
+            "Команда ще раз — повернути все назад."
+        )
+    else:
+        await message.reply(
+            "🔊 <b>Сповіщення знову активні</b> для цього чату: заміни, "
+            "нагадування за день і ранковий дайджест."
+        )
 
 
 # Текстовий тригер: «розклад ...», «Бот розклад ...», «Башмак розклад...».
@@ -308,10 +385,24 @@ _TEXT_TRIGGER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# «Бот кинь справдзіани», «шо по дз», «Спраwdzjanи є?» — без команди теж працює.
+_TEXT_SPZ_RE = re.compile(
+    r"^\s*(?:(?:" + _TRIGGER_ALT + r")[\s,.!?:;]+)??"
+    r"(?:кинь|кидай|покажи|дай|даш|шо по|що по|які|какие|какі|буде|будуть|маємо)?\s*"
+    r"(?:/sprawdziany|/sprawdzian|sprawdzian\w*|справдз\w*|картківк\w*|kartk\w*"
+    r"|\bдз\b|задан\w+\s+домаш\w*|домаш\w+)\b",
+    re.IGNORECASE,
+)
+
 
 async def cmd_rozklad_text(message: Message):
     """Text-варіант: «розклад на п'ятницю» (без слеша) теж працює."""
     await cmd_rozklad(message)
+
+
+async def cmd_sprawdziany_text(message: Message):
+    """Text-варіант: «Бот шо по дз» (без слеша) теж працює."""
+    await cmd_sprawdziany(message)
 
 
 def register_handlers(dp) -> None:
@@ -319,17 +410,30 @@ def register_handlers(dp) -> None:
     dp.message.register(cmd_rozklad_jutro, Command("rozklad_jutro"))
     dp.message.register(cmd_rozklad_tydzien, Command("rozklad_tydzien", "tydzien"))
     dp.message.register(cmd_rozklad_status, Command("rozklad_status", "rozklad_state", "rozklad_statuss"))
+    dp.message.register(cmd_sprawdziany, Command("sprawdziany", "sprawdzian", "dz"))
+    dp.message.register(cmd_vulcan_silence, Command("vulcan_silence", "vulcan_mute"))
     dp.message.register(cmd_rozklad_text, F.text.regexp(_TEXT_TRIGGER_RE))
+    dp.message.register(cmd_sprawdziany_text, F.text.regexp(_TEXT_SPZ_RE))
+    dp.callback_query.register(on_vulcan_callback, F.data.startswith("vulcan:"))
 
 
 def register_watchers(bot, background_tasks) -> None:
-    """Тримає сесію VULCAN живою, поки бот працює (якщо увімкнено)."""
+    """Тримає сесію VULCAN живою і слідкує за змінами (якщо увімкнено)."""
     if not _vulcan_enabled() or not vulcan_utils.is_configured():
         return
-    try:
-        task = asyncio.get_running_loop().create_task(vulcan_utils.keepalive_watcher())
-    except RuntimeError:
+
+    import config
+    if getattr(config, "VULCAN_NOTIFY_ENABLED", True):
+        # notify-цикл САМ тримає сесію живою (кожна ітерація = запит до API),
+        # тому окремий keepalive тут більше не стартує
+        import vulcan_notify
+        vulcan_notify.register_watchers(bot, background_tasks)
         return
-    if background_tasks is not None:
-        background_tasks.add(task)
-    log.info("Vulcan plugin: keepalive зареєстровано")
+
+    # spowіщення вимкнено -> старий Keepalive, щоб сесія не протухала
+    import tasks
+    if tasks.spawn_watch("vulcan_keepalive",
+                         lambda: vulcan_utils.keepalive_watcher(),
+                         tasks_set=background_tasks) is None:
+        return
+    log.info("Vulcan plugin: keepalive зареєстровано (notify вимкнено)")

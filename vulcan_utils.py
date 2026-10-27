@@ -420,6 +420,22 @@ class VulcanClient:
             raise VulcanBadData("/api/PlanZajec — очікувався масив")
         return data, cached
 
+    async def events_raw(self, key: str, ts_from: str, ts_to: str,
+                         *, force: bool = False) -> tuple[list[dict], bool]:
+        """/api/SprawdzianyZadaniaDomowe: sprawdziany/kartkówki + zadania domowe.
+
+        Елемент: {typ: int (1 = sprawdzian/картківка, 2 = zadanie domowe),
+        przedmiotNazwa, data (ISO), hasAttachment, id}.
+        """
+        data, cached = await self._get_cached(
+            "/api/SprawdzianyZadaniaDomowe",
+            {"key": key, "dataOd": ts_from, "dataDo": ts_to},
+            _TTL, force=force,
+        )
+        if not isinstance(data, list):
+            raise VulcanBadData("/api/SprawdzianyZadaniaDomowe — очікувався масив")
+        return data, cached
+
     async def day_schedule(self, d: date, *, force: bool = False) -> tuple[list[dict], dict | None, bool]:
         """Розклад на день: (уроки, свято|None, from_cache).
 

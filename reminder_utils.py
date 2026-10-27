@@ -85,7 +85,9 @@ def parse_time_spec(text: str) -> tuple[float | None, str]:
 
     # 2. Перевірка на відносний час (комбінація годин, хвилин, секунд)
     pattern = re.compile(
-        r"^(\d+)\s*(секунд[иу]?|sec|сек|s|минут[иу]?|хвилин[иу]?|min|хв|мин|m|години?|часов|часа|час|год|hr|h|дней|днів|день|дня|d)(?=[0-9\s.,!?:;_-]|$)\s*",
+        r"^(\d+)\s*(секунд[иу]?|sec|сек|s|с|минут[иу]?|хвилин[иу]?|min|хв|мин|m|м"
+        r"|годин[аи]?|часов|часа|час|год|hr|h|дней|днів|день|дня|d|д"
+        r")(?=[0-9\s.,!?:;_\-]|$)\s*",
         re.IGNORECASE,
     )
 
@@ -102,13 +104,13 @@ def parse_time_spec(text: str) -> tuple[float | None, str]:
         unit = m.group(2).lower()
         curr_text = curr_text[m.end():].strip()
 
-        if unit.startswith(("s", "сек")):
+        if unit.startswith(("s", "сек", "с")):
             total_seconds += val
-        elif unit.startswith(("m", "хв", "мин")):
+        elif unit.startswith(("m", "хв", "мин", "м")):
             total_seconds += val * 60
         elif unit.startswith(("h", "год", "час")):
             total_seconds += val * 3600
-        elif unit.startswith(("d", "ден")):
+        elif unit.startswith(("d", "ден", "дні", "дн", "д")):
             total_seconds += val * 86400
 
     if found_any and total_seconds > 0:

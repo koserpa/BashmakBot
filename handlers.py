@@ -24,7 +24,10 @@ import absence_utils
 import bot_state
 import drama_utils
 import reminder_utils
-from config import ADMIN_USERNAME, GEMINI_MODEL, GEMINI_RPD_LIMIT, TRIGGER_NAMES, USER_CONTEXT
+from config import (
+    ADMIN_USERNAME, GEMINI_MODEL, GEMINI_RPD_LIMIT, TTS_RPD_LIMIT,
+    TRIGGER_NAMES, USER_CONTEXT,
+)
 from features import (
     REACT_UNPROMPTED_CHANCE,
     REACT_UNPROMPTED_ENABLED,
@@ -41,8 +44,10 @@ from gemini_client import (
     synthesize_speech,
     transcribe_media,
     tts_quota_low,
+    tts_stats,
     strip_reaction_marker,
 )
+import tasks
 from media_utils import (
     build_reply_media_context,
     download_or_reply,
@@ -596,7 +601,11 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             "/rozklad [сьогодні|завтра|післязавтра|день тижня|дата] — реальний розклад 2TC з VULCAN (дата: 2.11, «2 листопада», через N днів)\n"
             "/rozklad тиждень — тижневий огляд (пн-нд)\n"
             "«розклад ...» текстом (без слеша) теж працює\n"
+            "/sprawdziany — всі sprawdziany/картківки/дз на 30 днів («Бот шо по дз» теж працює)\n"
             "/rozklad_status — стан сесії VULCAN\n"
+            "/vulcan_silence — вкл/викл проактивні сповіщення для чату\n"
+            "🔔 Автоматично: заміни/відміни в розкладі кидаю в чат сам, "
+            "вечором наперед попереджаю про sprawdzian/kartkówka/дз, ранком кажу розклад на сьогодні\n"
             "/remind <час> <текст> — поставити нагадування (/remind 15m піти їсти)\n"
             "/reminders — список активних нагадувань у чаті\n"
             "/remind_del <номер> — скасувати нагадування\n"
@@ -607,7 +616,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             text += (
                 "\n\nТільки для адміна:\n"
                 "/reset — очистити пам'ять поточного чату\n"
-                "/status — статус бота (uptime, розмір історії)\n"
+                "/status — статус бота (uptime, квоти Gemini/TTS, живі фонові циклі)\n"
                 "/model — інфо про модель та ліміти запитів\n"
                 "/features — які фіча-флаги зараз увімкнено"
             )
@@ -623,16 +632,28 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         from config import HISTORY_SIZE
 
         uptime_sec = int(time.time() - bot_state.START_TIME)
-        hours, remainder = divmod(uptime_sec, 3600)
-        minutes, seconds = divmod(remainder, 60)
+        uptime = f"{uptime_sec // 3600}г {uptime_sec % 3600 // 60}хв {uptime_sec % 60}с"
         chat_len = len(bot_state.history[message.chat.id])
+        total_chats = len(bot_state.history)
 
-        await message.answer(
-            "📊 Статус бота\n"
-            f"Модель: {GEMINI_MODEL}\n"
-            f"Uptime: {hours}г {minutes}хв {seconds}с\n"
-            f"Повідомлень в пам'яті цього чату: {chat_len}/{HISTORY_SIZE}"
-        )
+        lines = [
+            "📊 <b>Статус бота</b>",
+            f"🤖 Модель: <code>{GEMINI_MODEL}</code>",
+            f"⏱ Uptime: {uptime}",
+            f"💬 Історія цього чату: {chat_len}/{HISTORY_SIZE}, "
+            f"чатів у пам'яті: {total_chats}",
+            f"✍️ Gemini сьогодні: {gemini_stats.count_today}"
+            + (f" / ~{GEMINI_RPD_LIMIT} RPD" if GEMINI_RPD_LIMIT else ""),
+            f"🔊 TTS сьогодні: {tts_stats.count_today} (ліміт ~{TTS_RPD_LIMIT})",
+        ]
+        # Живі фонові watcher-х (супервізор tasks.py): ім'я -> Task
+        if tasks.WATCHERS:
+            alive = ", ".join(sorted(tasks.WATCHERS))
+        else:
+            alive = "—"
+        lines.append(f"🫀 Фонові циклі: {alive}")
+
+        await message.answer("\n".join(lines))
 
     @dp.message(Command("model"), IsAdmin())
     async def cmd_model(message: Message):

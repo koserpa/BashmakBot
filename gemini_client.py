@@ -22,6 +22,12 @@ from config import (
 
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
 
+# Ліміт ВІДПОВІДІ (output), а не запиту. ВАЖЛИВО: у thinking-моделей роздуми
+# теж їдять цей ліміт — при 1024 бот інколи обрізав відповідь посеред речення
+# або повертав пустку (finish_reason=MAX_TOKENS). Піднімається тут же, без
+# заміни коду: GEMINI_MAX_OUTPUT=2048 (чи вище) у .env.
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT", "1024") or "1024")
+
 log = logging.getLogger("Bashma4ek_Bot.gemini")
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -193,7 +199,7 @@ async def _ask_gemini_inner(contents: list, current_date_str: str) -> str:
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    max_output_tokens=1024,   # thinking-токени теж рахуються сюди
+                    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
                     temperature=0.7,
                 ),
             )
@@ -209,7 +215,15 @@ async def _ask_gemini_inner(contents: list, current_date_str: str) -> str:
 
         except errors.ClientError as e:
             if e.code == 429:
-                retry_after = int(e.headers.get("retry-after", "120"))
+                # retry-after може бути нечисловим або хіба відсутнім —
+                # не словимо ValueError прямо в except-роуті. Плюс кап 90с:
+                # юзер стоїть і чекає відповідь, пов'язаний це.
+                retry_after = 120
+                try:
+                    retry_after = int((e.headers or {}).get("retry-after") or "120")
+                except (TypeError, ValueError):
+                    retry_after = 120
+                retry_after = max(1, min(retry_after, 90))
                 log.warning(f"Gemini 429 – waiting {retry_after}s")
                 await asyncio.sleep(retry_after)
                 # retry the request (will consume another attempt from the loop)
