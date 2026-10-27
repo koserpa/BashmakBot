@@ -2,7 +2,7 @@
 
 > Цей файл — довідник для наступного ШІ/розробника. Тут описано, що це за проект,
 > як він працює, як його запускати, і які граблі вже обійдено.
-> Оновлено: 2026-10-26.
+> Оновлено: 2026-10-27 (вечір).
 
 ---
 
@@ -134,10 +134,12 @@ keepalive_watcher не стартує, коли notify увімкнено (`VULC
 2. **Ранковий дайджест** (`VULCAN_MORNING_HOUR:MINUTE`, default 6:50):
    розклад на сьогодні + події сьогодні, раз на день (`morning_done_day`).
 3. **За день до події**: після `VULCAN_REMIND_HOUR` (default 18) тягнемо
-   `/api/SprawdzianyZadaniaDomowe` на завтра: typ=1 → "🧪 Sprawdzian",
-   typ=2 → "📖 Zadanie domowe", typ=3 → "📝 Kartkówka" (розвідка 27.10:
-   у живих даних є typ 1/2/3/4; typ 4 поки «Подія (typ 4)» — перевірити
-   в Portal UI який це род). Ids сповіщених зберігаються з ДАТОЮ сповіщення
+   `/api/SprawdzianyZadaniaDomowe` на завтра. **Словарь typ — стандартный VULCAN**
+   (порядок у дропдауні «Rodzaj»: 1=Sprawdzian, 2=Kartkówka, 3=Praca klasowa,
+   4=Zadanie domowe). Верифікація 27.10.2026: typ=1 та typ=2 підтверджено живо
+   (typ=2 → Chemia 12.11 в UI = «Kartkówка», НЕ «Zadanie domowe» — попередня
+   мапа 2=дз була НЕВІРНА). Невідомий typ → генерик «Подія (typ N)» (не падати).
+   Ids сповіщених зберігаються з ДАТОЮ сповіщення
    та чистяться при _save() (TTL 35 днів, `NOTIFIED_TTL_DAYS`) —
    рестарти не спам знову, state не розростається.
 4. **`/sprawdziany`** (публічний API `upcoming_events_text(days=30)`) —
@@ -156,7 +158,8 @@ GET /api/Context                                   -> учень/ключ
 GET /api/PlanZajec?key&dataOd&dataDo&zakresDanych=2 -> розклад (item.zmiany = заміни)
 GET /api/DniWolne?key&dataOd&dataDo                -> свята
 GET /api/SprawdzianyZadaniaDomowe?key&dataOd&dataDo -> sprawdziany + дз!
-     (item: {typ: 1|2, przedmiotNazwa, data, hasAttachment, id})
+     (item: {typ: 1..4, przedmiotNazwa, data, hasAttachment, id};
+      typ→назва див. словарь вище)
 GET /api/*Tablica (SprawdzianyTablica, ZadaniaDomoweTablica, WazneDzisiaj...) -> тільки "сьогодні"
 ```
 Всі ендпоінти GET+query, утилізуються з кукі сесії; невідомий шлях сервер віддає
@@ -191,7 +194,7 @@ GET /api/*Tablica (SprawdzianyTablica, ZadaniaDomoweTablica, WazneDzisiaj...) ->
 | `VULCAN_NOTIFY` | `false` — вимкнути всі проактивні сповіщення (штатний keepalive повертається) |
 | `PORT` | порт health-сервера (8000) |
 | `ADMIN_USERNAME` | `koserpa` |
-| `TRIGGER_NAMES` | імена-тригери бота |
+| `TRIGGER_NAMES` | імена-тригери бота (⚠️ обов'язково на Koyeb Secrets — без нього name-тригери мовчать) |
 
 **Секретне правило в `config.py` SYSTEM_PROMPT** (рядок ~143): повідомлення від
 користувача `koserpa`, що закінчуються словом 'пж', виконуються буквально й точно.
@@ -222,19 +225,40 @@ GET /api/*Tablica (SprawdzianyTablica, ZadaniaDomoweTablica, WazneDzisiaj...) ->
 
 ## 8. Стан на зараз
 
-- Авто-логін працює live; всі тести зелені (test_vulcan_notify / _autologin / _utils,
-  smoke_test_plugins). GitHub Actions (`.github/workflows/tests.yml`) гоняє
-  оффлайн-тести на кожен пуш.
+- **CI GREEN (27.10.2026, run 9a093cf).** Перший прогін ebba2dd падав на
+  `test_text_utils.py::test_strip_trigger`: тести залежали від локального `.env`
+  (`TRIGGER_NAMES` читається в config.py при імпорті; на CI .env немає).
+  Фікс: `test_text_utils.py` сам задає `os.environ["TRIGGER_NAMES"]` ДО імпорту
+  text_utils/config. Логи CI анонімно не читаються (API 403), але юзер може
+  скачати zip логів з GitHub UI — так діагноз і знайшли.
 - НОВЕ (27.10.2026): проактивні сповіщення `vulcan_notify.py` — заміни/відміни
   (diff розкладу кожні 15хв, ніч 00:00–06:00 пауза) + нагадування за день до
   sprawdzian/дз (18:00) + ранковий дайджест (6:50) + `/sprawdziany` (текстові
   тригери «шо по дз» тощо) + `/vulcan_silence`. Цикл об'єднано з keepalive
-  (менше запитів до порталу). Live-тест пройдено.
-- НОВЕ (27.10.2026, вечір): typ=3 розпізнається як «📝 Kartkówка» (живі дані
-  мають typ 1/2/3/4; typ 4 поки генерик — звірити з Portal UI коли трапиться);
-  state-чистка `notified_events` (дата замість true, TTL 35 днів у `_save`);
-  inline-кнопки під розкладом одень/тижден (@callback `vulcan:*`).
-- НОВЕ (27.10.2026, не-vulcan): супервізор фонових циклів `tasks.py`
+  (менше запитів до порталу). Live-тест пройдено. state-чистка `notified_events`
+  (дата замість true, TTL 35 днів у `_save`); inline-кнопки під розкладом
+  день/тиждень (`vulcan:*`) — працюють (скріншоти юзера).
+- **/help фікс (27.10.2026):** TelegramBadRequest «Unsupported start tag "час"» —
+  бот шле HTML, а в тексті /help стояло `/remind <час> <текст>`; Telegram їв
+  `<час>` за тег і відмовлявся показувати повідомлення. Замінено на літеральні
+  приклади («/remind 15m текст»). Правило: у HTML-меседжах не писати
+  кутові `<слово>` без тега/без `<code>`, і після редагувань хелпу перевіряти
+  ії на живому ботові.
+- **Тест-гігієна:** `test_vulcan_notify.py` ізолює state (`vn.STATE_FILE` →
+  tempdir; раніше тест маратив реальний `data/vulcan_notify.json`, а в state
+  lez фейковий чат 999 → «chat not found(1/10)» у логах).
+- Пуші 27.10.2026: `f79e27a` (typ-мапа + /help), `9a093cf` (детермінованість
+  тестів) — поверх ebba2dd; origin/main == local main.
+- ⚠️ **На Koyeb обов'язково є `TRIGGER_NAMES` у Secrets** — без нього
+  name-тригери мовчать, працює тільки @mention. Локально лежить у `.env`.
+- **Мапа typ ВИПРАВЛЕНА (27.10.2026, вечір):** стандартний VULCAN —
+  1=Sprawdzian, 2=Kartkówka, 3=Praca klasowa, 4=Zadanie domowe. typ=2→Kartkówка
+  підтверджено скріншотом юзера (Chemia 12.11 в UI = «Kartkówка», попередня
+  мапа «2=дз» була хибною). typ=3 цього року ще не зустрічався (0 записів),
+  typ=4 — Informatyka 05.10/Chemia 15.10 (минулий час; звірити в UI колись).
+  SPA-бандл обфускований — статично назви з нього не сидять; i18n містить
+  порядок «Sprawdzian, Kartkówka, Praca klasowa, Zadanie domowe» = 1..4.
+- Супервізор фонових циклів `tasks.py`
   (авто-перезапуск впалых watcher-ів, реєстр `WATCHERS` → видно в `/status`);
   `GEMINI_MAX_OUTPUT` (env, default 1024 — thinking-токени теж лімітовані);
   безпечний parse retry-after (429, кап 90с); /status розширено (квоти, чати,
