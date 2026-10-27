@@ -7,6 +7,13 @@ import sys
 
 import vulcan_notify as vn
 
+# Ізоляція: тести НЕ мають марати реальний data/vulcan_notify.json
+import os as _os
+import tempfile as _tempfile
+vn.STATE_FILE = _os.path.join(_tempfile.gettempdir(), "vulcan_notify_tests.json")
+if _os.path.exists(vn.STATE_FILE):
+    _os.remove(vn.STATE_FILE)
+
 
 def lesson(date, start, subject, *, canceled=False, notice="", changes=()):
     return {
@@ -131,13 +138,20 @@ def test_prune() -> None:
     pruned = vn._prune_notified(ev, today)
     assert "101" not in pruned and "102" in pruned
     assert pruned["103"] is True and pruned["104"] == "garbage"
-    # typ 3 -> «Kartkówka» (розвідка живого API 27.10.2026)
-    assert vn._EVENT_TYPE_NAMES[3] == "📝 Kartkówka"
+    # Стандартний словарь VULCAN: 1=Sprawdzian, 2=Kartkówka, 3=Praca klasowa,
+    # 4=Zadanie domowe. typ=2 → «Kartkówka» підтверджено живим API (Chemia
+    # 12.11.2026 в UI — «Kartkówка»), а не «Zadanie domowe», як думали раніше.
+    assert vn._EVENT_TYPE_NAMES[1] == "🧪 Sprawdzian"
+    assert vn._EVENT_TYPE_NAMES[2] == "📝 Kartkówka"
+    assert vn._EVENT_TYPE_NAMES[3] == "📚 Praca klasowa"
+    assert vn._EVENT_TYPE_NAMES[4] == "📖 Zadanie domowe"
     card = vn.format_daybefore_card(date(2026, 10, 28), [
-        {"typ": 3, "przedmiotNazwa": "Biologia", "data": "2026-10-28T00:00:00Z"},
+        {"typ": 2, "przedmiotNazwa": "Chemia", "data": "2026-10-28T00:00:00Z"},
+        {"typ": 4, "przedmiotNazwa": "Polski", "data": "2026-10-28T00:00:00Z"},
     ])
-    assert "Kartkówka" in card and "Biologia" in card
-    assert "typ 3" not in card                # генерик більше не чіпляється
+    assert "Kartkówka" in card and "Chemia" in card
+    assert "Zadanie domowe" in card and "Polski" in card
+    assert "typ 2" not in card                # генерик більше не чіпляється
     print("  prune state + kartkówka ✓")
 
 

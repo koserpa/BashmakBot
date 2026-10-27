@@ -10,8 +10,8 @@
 
 2. НАГАДУВАННЯ ЗА ДЕНЬ ДО ПОДІЇ
    Щодня після VULCAN_REMIND_HOUR год. (Варшава) перевіряємо
-   /api/SprawdzianyZadaniaDomowe на завтра: sprawdzian (typ=1),
-   zadanie domowe (typ=2) і т.д. Якщо є — одна картка «Завтра ...».
+   /api/SprawdzianyZadaniaDomowe на завтра: sprawdzian (typ=1), kartkówka (typ=2),
+   praca klasowa (typ=3), zadanie domowe (typ=4). Якщо є — картка «Завтра ...».
 
 Кому слати: змінна VULCAN_NOTIFY_CHATS (chat_id через кому) АБО чати,
 де хтось користувався /розклад (запам'ятовуються в data/vulcan_notify.json).
@@ -36,13 +36,17 @@ import vulcan_utils as vu
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "data", "vulcan_notify.json")
 
-# Словник typ у /api/SprawdzianyZadaniaDomowe (за живим трафіком порталу;
-# розвідка 27.10.2026: зустрічаються typ 1/2/3/4, назви — стандартний словарь
-# VULCAN: 1=Sprawdzian, 2=Zadanie domowe, 3=Kartkówka; 4 — поки генерично).
+# Словник typ у /api/SprawdzianyZadaniaDomowe.
+# Стандартний словарь VULCAN (порядок у дропдауні «Rodzaj» на порталі):
+#   1=Sprawdzian, 2=Kartkówka, 3=Praca klasowa, 4=Zadanie domowe.
+# Верифікація 27.10.2026: typ=1 → Sprawdzian (J.niemiecki 04.11, Matematyka 05.11
+# сходяться зі скріншотів), typ=2 → Kartkówka (Chemia 12.11 — «Kartkówka» в UI).
+# typ=3 цей рік ще не зустрічався, typ=4 без назви в API — фолбек «typ N».
 _EVENT_TYPE_NAMES = {
     1: "🧪 Sprawdzian",
-    2: "📖 Zadanie domowe",
-    3: "📝 Kartkówka",
+    2: "📝 Kartkówka",
+    3: "📚 Praca klasowa",
+    4: "📖 Zadanie domowe",
 }
 
 
@@ -246,9 +250,9 @@ def format_daybefore_card(d: date, events: list[dict]) -> str:
         typ = e.get("typ")
         subj = (e.get("przedmiotNazwa") or "(без предмета)").strip()
         name = _EVENT_TYPE_NAMES.get(typ, f"• Подія (typ {typ})")
-        if typ in (1, 3):                # sprawdzian / kartkówka
+        if typ in (1, 2, 3):             # sprawdzian / kartkówka / praca klasowa
             lines.append(f"{name}: <b>{subj}</b>")
-        elif typ == 2:
+        elif typ == 4:                   # zadanie domowe
             lines.append(f"{name} з <b>{subj}</b>")
         else:
             lines.append(f"• {subj}")
