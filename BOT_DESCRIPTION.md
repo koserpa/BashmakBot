@@ -110,6 +110,7 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 4. **Reminder System** - /remind command to set time-based reminders in chat
 5. **Date Synchronization** - Periodically updates current date from internet source
 6. **Health Server** - Minimal HTTP endpoint for platforms requiring web service (Koyeb)
+7. **VULCAN Schedule Notifications** - Every 15 min polls the student's VULCAN portal and posts schedule changes to the chat: cancellations, teacher/room substitutions, moved lessons, group changes and class outings. Detects changes by diffing lesson signatures against a local snapshot; on a fresh deploy it still reports current changes instead of silently seeding a baseline. Also sends a morning digest and day-before exam/homework reminders (`vulcan_notify.py`). Change cards list the teacher (and room) next to each lesson, show only the new value in the change line (no duplicated old value or lesson name), and group all of a lesson's changes into one bullet.
 
 ### Media Handling
 - **Photos**: Downloads, sends to Gemini Vision for description/analysis

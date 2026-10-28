@@ -1,0 +1,12 @@
+# Не тягнути в образ те, що не потрібно для запуску.
+# .env — секрети (BOT_TOKEN, GEMINI_API_KEY, VULCAN_LOGIN/PASSWORD):
+# потрапляючи в шар образу, вони лишаються в історії назавжди.
+.git
+.github
+.env
+.env.*
+data
+*.log
+__pycache__
+*.pyc
+_debug_help.py

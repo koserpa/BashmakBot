@@ -4,7 +4,9 @@
 розкладів: якщо сайт недоступний або сесія протухла — бот чесно каже про
 це (форматування даних: vulcan_utils.schedule_text).
 
-Команди (як зі слешем, так і просто словом «розклад ...» у тексті):
+Команди (як зі слешем, так і словом «розклад ...» у тексті — але текстом
+лише зі зверненням до бота: «башмак, розклад …», «@Bashma4ek_Bot розклад …»
+або reply на повідомлення бота):
   /rozklad [аргумент]     — сьогодні/завтра/післязавтра/день тижня/«через N днів»/дата
   /rozklad тиждень        — реальний тижневий огляд (пн-нд)
   /rozklad_jutro          — розклад на завтра
@@ -26,11 +28,13 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import F
-from aiogram.filters import Command
+from aiogram.filters import BaseFilter, Command
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 
+import bot_state
+import text_utils
 import vulcan_utils
 
 log = logging.getLogger("Bashma4ek_Bot.plugins.vulcan")
@@ -254,11 +258,11 @@ async def _reply_day(message: Message, target: date) -> bool:
 
 async def cmd_rozklad(message: Message):
     """Головна команда розкладу — реальні дані з Dziennik VULCAN."""
-    arg = ""
-    if message.text:
-        parts = message.text.split(maxsplit=1)
-        if len(parts) > 1:
-            arg = parts[1].strip()
+    # прибираємо звернення (@username / «башмак») і сам слеш-ключ, щоб
+    # «башмак, розклад на завтра» і «/rozklad завтра» дали той самий аргумент
+    text = text_utils.strip_trigger(message.text or "", bot_state.BOT_USERNAME)
+    text = re.sub(r"^/(?:rozklad|schedule)\b", "", text, flags=re.IGNORECASE).strip()
+    arg = text
 
     target = _target_from_arg(arg)
 
@@ -375,11 +379,16 @@ async def cmd_vulcan_silence(message: Message):
         )
 
 
-# Текстовий тригер: «розклад ...», «Бот розклад ...», «Башмак розклад...».
+# Текстовий тригер: «розклад ...», «Бот розклад ...», «@Bashma4ek_Bot розклад...».
 # Побудований з TRIGGER_NAMES, тож реагує на тіж самі імена, що й чат.
+# ВАЖЛИВО: сам текст-тригер ще не достатній — потрібне звернення до бота
+# (ім'я/@username/reply), це перевіряє фільтр AddressedToBot нижче.
 from config import TRIGGER_NAMES
 
-_TRIGGER_ALT = "|".join(re.escape(n) for n in ("бот", *TRIGGER_NAMES))
+_TRIGGER_ALT = "|".join([
+    re.escape("бот"), r"@\w+",
+    *(re.escape(n) for n in TRIGGER_NAMES),
+])
 _TEXT_TRIGGER_RE = re.compile(
     r"^\s*(?:(?:" + _TRIGGER_ALT + r")[\s,.!:;]+)??(?:/rozklad|/schedule|розклад|расписан\w*|план|schedule)\b",
     re.IGNORECASE,
@@ -395,13 +404,34 @@ _TEXT_SPZ_RE = re.compile(
 )
 
 
+def _addressed_to_bot(message: Message) -> bool:
+    """Чи звертаються до бота: @username, ім'я-тригер (на початку/в кінці)
+    або reply на його повідомлення. Без цього текстові тригери не працюють —
+    щоб «розклад» у звичайній розмові не смикав бота."""
+    replied = message.reply_to_message
+    if replied and replied.from_user and replied.from_user.id == bot_state.BOT_ID:
+        return True
+    text = message.text or message.caption or ""
+    if not text:
+        return False
+    return (
+        text_utils.text_mentions_bot_username(text, bot_state.BOT_USERNAME)
+        or text_utils.text_mentions_trigger_name(text)
+    )
+
+
+class AddressedToBot(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        return _addressed_to_bot(message)
+
+
 async def cmd_rozklad_text(message: Message):
-    """Text-варіант: «розклад на п'ятницю» (без слеша) теж працює."""
+    """Text-варіант зі зверненням: «башмак, розклад на п'ятницю» / reply боту."""
     await cmd_rozklad(message)
 
 
 async def cmd_sprawdziany_text(message: Message):
-    """Text-варіант: «Бот шо по дз» (без слеша) теж працює."""
+    """Text-варіант зі зверненням: «бот шо по дз» / reply боту."""
     await cmd_sprawdziany(message)
 
 
@@ -412,8 +442,8 @@ def register_handlers(dp) -> None:
     dp.message.register(cmd_rozklad_status, Command("rozklad_status", "rozklad_state", "rozklad_statuss"))
     dp.message.register(cmd_sprawdziany, Command("sprawdziany", "sprawdzian", "dz"))
     dp.message.register(cmd_vulcan_silence, Command("vulcan_silence", "vulcan_mute"))
-    dp.message.register(cmd_rozklad_text, F.text.regexp(_TEXT_TRIGGER_RE))
-    dp.message.register(cmd_sprawdziany_text, F.text.regexp(_TEXT_SPZ_RE))
+    dp.message.register(cmd_rozklad_text, F.text.regexp(_TEXT_TRIGGER_RE), AddressedToBot())
+    dp.message.register(cmd_sprawdziany_text, F.text.regexp(_TEXT_SPZ_RE), AddressedToBot())
     dp.callback_query.register(on_vulcan_callback, F.data.startswith("vulcan:"))
 
 

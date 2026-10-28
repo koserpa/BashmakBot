@@ -8,8 +8,11 @@
 - plugins/         — плагінна система (авто-завантаження)
 """
 import asyncio
+import json
 import logging
 import os
+import time
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -54,11 +57,39 @@ def _validate_config() -> None:
 
 async def _start_health_server() -> None:
     """Koyeb (безкоштовний план) вимагає Web Service з відкритим портом —
-    піднімаємо мінімальний HTTP-сервер для health-check поруч з polling'ом."""
+    піднімаємо мінімальний HTTP-сервер для health-check поруч з polling'ом.
+
+    /health віддає не просто «OK», а стан VULCAN: коли був останній успішний
+    полінг розкладу, скільки цілей і чи жива сесія. HTTP-код завжди 200:
+    Koyeb на 503 перезапускає сервіс, а перезапуск не лікує мертву сесію
+    VULCAN (лише втрачає ephemeral state і спамить дублями карток).
+    """
     port = int(os.getenv("PORT", "8000"))
+    from vulcan_notify import health_info
 
     async def health(request):
-        return web.Response(text="OK")
+        info = health_info()
+        stale_after = max(45, info["poll_interval_min"] * 3) * 60
+        last = info.get("last_poll_at")
+        age = None
+        if last:
+            try:
+                age = int(time.time() - datetime.fromisoformat(last).timestamp())
+            except (TypeError, ValueError):
+                age = None
+        degraded = bool(
+            not info.get("configured")
+            or info.get("last_poll_ok") is False
+            or age is None or age > stale_after
+        )
+        payload = {
+            "status": "degraded" if degraded else "ok",
+            "uptime_sec": int(time.time() - bot_state.START_TIME),
+            "vulcan": info,
+            "vulcan_poll_age_sec": age,
+            "stale_after_sec": stale_after,
+        }
+        return web.json_response(payload)
 
     app = web.Application()
     app.router.add_get("/", health)

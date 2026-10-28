@@ -25,6 +25,7 @@ import json
 import logging
 import os
 from datetime import date, datetime, timedelta
+from html import escape as _esc
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -112,14 +113,53 @@ def _prune_notified(events: dict[str, Any], today: date) -> dict[str, Any]:
     return keep
 
 
+# ----------------------------------------------------------------------
+# Телеметрія для /health (без мережі: останній цикл перевірки розкладу)
+# ----------------------------------------------------------------------
+
+LAST_POLL: dict[str, Any] = {"at": None, "ok": None, "error": "", "days": 0}
+
+
+def _mark_poll(ok: bool, *, error: str = "", days: int = 0) -> None:
+    LAST_POLL.update({
+        "at": datetime.now(TZ).isoformat(timespec="seconds"),
+        "ok": ok,
+        "error": (error or "")[:200],
+        "days": days,
+    })
+
+
+def health_info() -> dict[str, Any]:
+    """Стан VULCAN-частини для /health. Мережу не чіпає (безпечно для
+    health-check кожні кілька секунд)."""
+    _ensure_loaded()
+    import config
+    return {
+        "configured": vu.is_configured(),
+        "baseline": _state.get("baseline"),
+        "targets": len(_target_chats()),
+        "tracked_lessons": len(_state.get("lesson_changes") or {}),
+        "muted_chats": len(_state.get("muted_chats") or []),
+        "last_poll_at": LAST_POLL["at"],
+        "last_poll_ok": LAST_POLL["ok"],
+        "last_poll_days": LAST_POLL["days"],
+        "last_poll_error": LAST_POLL["error"],
+        "poll_interval_min": int(config.VULCAN_CHANGES_POLL_MIN or 15),
+    }
+
+
 def remember_chat(chat_id: int) -> None:
-    """Запам'ятати чат, де користувались розкладом (ціль для сповіщень)."""
+    """Запам'ятати чат, де користувались розкладом (ціль для сповіщень).
+
+    Групи/супергрупи в Telegram мають ВІД'ЄМНИЙ chat_id — їх теж реєструємо
+    (раніше `cid <= 0` відкидав групи, тому картки йшли лише в приват).
+    """
     _ensure_loaded()
     try:
         cid = int(chat_id)
     except (TypeError, ValueError):
         return
-    if cid <= 0:            # 0/None — тестові/фейкові чати, не реєструємо
+    if cid == 0:            # 0 — фейковий/тестовий чат, не реєструємо
         return
     if cid in (m for m in _state["muted_chats"]):
         return  # цей чат запросив тишину — не реєструємо
@@ -177,32 +217,72 @@ def lesson_key(l: dict) -> str:
 
 
 def lesson_signature(l: dict) -> str:
-    """Канонічний підпис «змін» уроку: що в ньому відрізняється від бази.
+    """Канонічний підпис уроку для diff між опитуваннями.
 
-    Враховує: відміну (з причиною), заміну вчителя/сали, довільні примітки.
-    Зміни вчителя/часу БЕЗ помітки zmiany ІГНОРУЮТЬСЯ (бота цікавлять
-    саме заміни — так їх вписує адмін у Vulcan).
+    Рахується зі СТРУКТУРНИХ даних порталу (`raw_changes` з
+    `lesson_from_raw`), а не з готового тексту картки. Інакше будь-яка
+    правка формулювання («Заміна:» -> «Заміна на:») виглядає як нова
+    зміна, і після деплою бот шле дубль усім чатам.
+
+    `raw_changes` — список відсортованих `key=value` рядків на кожен
+    елемент `zmiany`; порядок ключів стабільний, порядок елементів
+    зберігається (портал іноді переставляє `zmiany`, тому сортуємо весь
+    список перед підписом).
     """
+    raw = l.get("raw_changes")
+    if raw is None:      # урок не з lesson_from_raw (тести/старі кеші)
+        raw = sorted(str(c) for c in (l.get("changes") or []))
     sig: dict[str, Any] = {
+        "v": 2,
         "c": 1 if l.get("canceled") else 0,
-        "n": (l.get("cancel_notice") or "")[:120],
-        "z": [str(c)[:160] for c in (l.get("changes") or [])],
+        "raw": sorted(raw),
+        "notes": sorted(str(n) for n in (l.get("raw_notes") or [])),
     }
     return json.dumps(sig, ensure_ascii=False, sort_keys=True)
 
 
+def _legacy_signature(l: dict) -> str:
+    """Старий (v1) формат підпису — тільки для міграції state.
+
+    У state до цього оновлення лежать підписи, зроблені з тексту змін.
+    Якщо порівнювати лише з новим підписом, перший же цикл після деплою
+    вирішив би, що змінились усі уроки, і надіслав дублі карток. Тому
+    «незміненим» вважаємо і збіг зі старим форматом; після першого
+    збереження state там уже новий підпис, і фолбек стає непотрібним.
+    """
+    return json.dumps({
+        "c": 1 if l.get("canceled") else 0,
+        "n": (l.get("cancel_notice") or "")[:120],
+        "z": sorted(str(c)[:160] for c in (l.get("changes") or [])),
+    }, ensure_ascii=False, sort_keys=True)
+
+
 def format_changes_card(day_name: str, ddmm: str, items: list[dict]) -> str:
     """Картка змін за один день. items = уроки, де зміни ЩОЙНО з'явились."""
-    head = f"🔔 <b>Сталося в розкладі — {day_name}, {ddmm}</b>"
+    head = f"🔔 <b>Зміни в розкладі — {day_name}, {ddmm}</b>"
     lines: list[str] = []
     for l in sorted(items, key=lambda x: (x["start"], x["end"])):
         t = f"{l['start']}" if l.get("start") else "--:--"
-        subj = "<b>" + (l.get("subject") or "?") + "</b>"
+        subj = "<b>" + _esc(l.get("subject") or "?") + "</b>"
+        # вчитель (і кабінет) — щоб картка була самодостатньою: у самій
+        # зміні ми вже не повторюємо старе значення, воно стоїть тут
+        who = (l.get("teacher") or "").strip()
+        room = (l.get("room") or "").strip()
+        extra = ", ".join(x for x in (
+            who, f"каб. {room}" if room else "",
+        ) if x)
+        if extra:
+            subj += f" ({_esc(extra)})"
+        # одна картка = один рядок на урок: назву не повторюємо, навіть якщо
+        # змін кілька (вони йдуть через «;» в тому ж рядку)
+        notes = [_esc(c) for c in (l.get("changes") or [])]
         if l.get("canceled"):
-            reason = f" ({l['cancel_notice']})" if l.get("cancel_notice") else ""
-            lines.append(f"❌ {t} {subj} — відмінено{reason}")
-        for c in (l.get("changes") or []):
-            lines.append(f"• {t} {subj} — {c}")
+            reason = f" ({_esc(l['cancel_notice'])})" if l.get("cancel_notice") else ""
+            notes.insert(0, f"відмінено{reason}")
+        if not notes:
+            continue
+        bullet = "❌" if l.get("canceled") else "•"
+        lines.append(f"{bullet} {t} {subj} — " + "; ".join(notes))
     if not lines:
         return ""
     return head + "\n" + "\n".join(lines)
@@ -231,7 +311,7 @@ def format_events_overview(events: list[dict], today: date) -> str:
         lines = []
         for e in by_day[iso]:
             typ = e.get("typ")
-            subj = (e.get("przedmiotNazwa") or "(без предмета)").strip()
+            subj = _esc((e.get("przedmiotNazwa") or "(без предмета)").strip())
             name = _EVENT_TYPE_NAMES.get(typ, f"Подія (typ {typ})")
             lines.append(f"  {name}: <b>{subj}</b>")
         blocks.append(head + "\n" + "\n".join(lines))
@@ -248,7 +328,7 @@ def format_daybefore_card(d: date, events: list[dict]) -> str:
     lines: list[str] = []
     for e in (events or []):
         typ = e.get("typ")
-        subj = (e.get("przedmiotNazwa") or "(без предмета)").strip()
+        subj = _esc((e.get("przedmiotNazwa") or "(без предмета)").strip())
         name = _EVENT_TYPE_NAMES.get(typ, f"• Подія (typ {typ})")
         if typ in (1, 2, 3):             # sprawdzian / kartkówka / praca klasowa
             lines.append(f"{name}: <b>{subj}</b>")
@@ -410,12 +490,25 @@ async def _notify(bot, text: str) -> bool:
     return sent
 
 
+def _lesson_date(l: dict) -> date | None:
+    try:
+        return date.fromisoformat(str(l.get("date") or "")[:10])
+    except ValueError:
+        return None
+
+
 def _compute_changes(lessons: list[dict], stored: dict[str, str],
-                     *, seed: bool = False) -> tuple[list[dict], dict[str, str]]:
+                     *, seed: bool = False,
+                     today: date | None = None) -> tuple[list[dict], dict[str, str]]:
     """Diff поточного стану проти збереженого.
 
     Повертає (уроки з НОВИМИ змінами, повний новий map).
-    seed=True -> перший запуск/файл загублений: тихо зберігаємо базу.
+
+    seed=True -> перший запуск/файл загублений (Koyeb ephemeral). Раніше
+    тут усе тихо «з'їдалось» — і заміни, зроблені до старту бота, не
+    приходили НІКОЛИ. Тепер базу зберігаємо, але зміни на сьогодні й далі
+    показуємо: краще один раз нагадати, ніж промовчати про заміну.
+    today=None -> показати всі зміни (для тестів/ручних викликів).
     """
     now_map: dict[str, str] = {}
     new_changed: list[dict] = []
@@ -425,10 +518,17 @@ def _compute_changes(lessons: list[dict], stored: dict[str, str],
         sig = lesson_signature(l)
         now_map[k] = sig
         if seed:
+            # минулі дні не турбуємо, решту — показуємо як «поточні зміни»
+            d = _lesson_date(l)
+            if has_changes and (today is None or (d is not None and d >= today)):
+                new_changed.append(l)
             continue
         prev = stored.get(k)
         if prev is not None and prev != sig and has_changes:
-            new_changed.append(l)
+            # стара версія підпису (текст замість сирих полів) — не зміна,
+            # а просто міграція state; інакше деплой = дубль усіх карток
+            if prev != _legacy_signature(l):
+                new_changed.append(l)
         elif prev is None and has_changes:
             # новий урок ІЗ змінами (напр., вчора вписали заміну на нове заняття)
             new_changed.append(l)
@@ -447,35 +547,40 @@ async def _changes_cycle(bot) -> None:
             lessons, day_from, day_to = await _week_lessons_fresh(client)
         except vu.VulcanAuthError:
             if not await _on_auth_error():
+                _mark_poll(False, error="сесія мертва, автологін не вдався")
                 log.warning("Vulcan notify: сесія мертва, авто-логін не вдався")
                 return
             client = await vu.get_client()
             lessons, day_from, day_to = await _week_lessons_fresh(client)
     except vu.VulcanDisabled:
+        _mark_poll(False, error="VULCAN не налаштований")
         return
     except vu.VulcanError as e:
+        _mark_poll(False, error=f"{type(e).__name__}: {e}")
         log.warning(f"Vulcan notify: план недоступний ({type(e).__name__}: {e})")
         return
 
+    _mark_poll(True, days=len(lessons))
     seed = "baseline" not in _state
-    changed, new_map = _compute_changes(lessons, dict(stored), seed=seed)
+    today = datetime.now(TZ).date()
+    changed, new_map = _compute_changes(
+        lessons, dict(stored), seed=seed, today=today,
+    )
     if seed:
         _state["baseline"] = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
-    _state["lesson_changes"] = new_map
-    if seed:
-        _save()
-        log.info("Vulcan notify: базова снапшот розкладу збережено (без сповіщень)")
-        return
 
     if not changed:
+        _state["lesson_changes"] = new_map
         _save()
+        if seed:
+            log.info("Vulcan notify: базова снапшот розкладу збережено")
         return
 
     # групуємо за датою і надсилаємо по днях
     by_day: dict[str, list[dict]] = {}
     for l in changed:
         by_day.setdefault(l["date"], []).append(l)
-    sent_any = False
+    delivered: set[str] = set()
     for iso in sorted(by_day):
         items = by_day[iso]
         try:
@@ -486,16 +591,36 @@ async def _changes_cycle(bot) -> None:
             vu.DAY_NAMES_PL[d.weekday()], d.strftime("%d.%m"), items,
         )
         if card and await _notify(bot, card):
-            sent_any = True
+            delivered.add(iso)
         else:
             log.warning("Vulcan notify: картку змін не доставлено (чатів 0?)")
+
+    # НЕ фіксуємо підписи змін, які не дійшли: інакше вони загубляться
+    # назавжди (типово — перший запуск без зареєстрованих чатів).
+    if len(delivered) != len(by_day):
+        for iso, items in by_day.items():
+            if iso in delivered:
+                continue
+            for l in items:
+                k = lesson_key(l)
+                if k in stored:
+                    new_map[k] = stored[k]      # старий підпис -> повторимо
+                else:
+                    new_map.pop(k, None)        # новий ключ -> «новий» знову
+    _state["lesson_changes"] = new_map
     _save()
-    if sent_any:
-        log.info(f"Vulcan notify: надіслано змін на {len(by_day)} день(ів)")
+    if delivered:
+        log.info(f"Vulcan notify: надіслано змін на {len(delivered)} день(ів)")
+    if seed:
+        log.info("Vulcan notify: базову снапшот збережено; поточні зміни надіслано")
 
 
 async def _tomorrow_cycle(bot) -> bool:
-    """Картка «за завтра»: sprawdzian/картківка/дз. True = щось надіслали."""
+    """Картка «за завтра»: sprawdzian/картківка/дз.
+
+    True = день закрито (слати більше не треба). False = варто повторити
+    наступного циклу: не дістали події з порталу або не змогли доставити.
+    """
     _ensure_loaded()
     try:
         client = await vu.get_client()
@@ -507,7 +632,7 @@ async def _tomorrow_cycle(bot) -> bool:
             client = await vu.get_client()
             tomorrow, raw_events = await _tomorrow_events_fresh(client)
     except vu.VulcanDisabled:
-        return False
+        return True
     except vu.VulcanError as e:
         log.warning(f"Vulcan notify: події недоступні ({type(e).__name__}: {e})")
         return False
@@ -520,18 +645,23 @@ async def _tomorrow_cycle(bot) -> bool:
     ]
     if not fresh:
         _save()
-        return False
+        return True
     card = format_daybefore_card(tomorrow, fresh)
     if not card:
         _save()
-        return False
+        return True
     ok = await _notify(bot, card)
+    if not ok:
+        # НЕ позначаємо як надіслане: інакше нагадування губиться назавжди
+        # (типово — свіжий деплой, коли в чаті ще ніхто не користувався
+        # розкладом, тобто цілей для розсилки немає).
+        _save()
+        return False
     for e in fresh:
         notified[str(e.get("id"))] = datetime.now(TZ).date().isoformat()
     _save()
-    if ok:
-        log.info(f"Vulcan notify: надіслано нагадування про завтра ({len(fresh)} подій)")
-    return ok
+    log.info(f"Vulcan notify: надіслано нагадування про завтра ({len(fresh)} подій)")
+    return True
 
 
 async def notify_watcher(bot) -> None:
@@ -567,31 +697,40 @@ async def notify_watcher(bot) -> None:
         except Exception as e:
             log.exception(f"Vulcan notify: помилка циклу змін: {e}")
 
-        # --- 2. ранковий дайджест ---
+        # --- 2. ранковий дайджест (тільки вранці: після рестарту о 22:00
+        #        «Доброго ранку» з розкладом уже недоречне) ---
         today = now.date().isoformat()
-        morning_due = (now.hour > m_hour
-                       or (now.hour == m_hour and now.minute >= m_minute))
+        morning_due = (now.hour < 12
+                       and (now.hour > m_hour
+                            or (now.hour == m_hour and now.minute >= m_minute)))
         if morning_due and _state.get("morning_done_day") != today:
+            ok = False
             try:
-                await _morning_cycle(bot)
+                ok = await _morning_cycle(bot)
             except Exception as e:
                 log.exception(f"Vulcan notify: помилка ранкового дайджеста: {e}")
-            _state["morning_done_day"] = today
-            _save()
+            # прапорець — лише якщо реально закрили день: інакше одна
+            # помилка API о 6:50 вбивала дайджест до наступної доби
+            if ok:
+                _state["morning_done_day"] = today
+                _save()
 
         # --- 3. нагадування за день ---
         if now.hour >= remind_hour and _state.get("remind_done_day") != today:
+            ok = False
             try:
-                await _tomorrow_cycle(bot)
+                ok = await _tomorrow_cycle(bot)
             except Exception as e:
                 log.exception(f"Vulcan notify: помилка циклу нагадувань: {e}")
-            _state["remind_done_day"] = today
-            _save()
+            if ok:
+                _state["remind_done_day"] = today
+                _save()
 
         await asyncio.sleep(poll_min * 60)
 
 
 def register_watchers(bot, background_tasks) -> None:
+    _ensure_loaded()
     if not _target_chats():
         log.info("Vulcan notify: чатів ще немає — активується після першого /rozklad")
         # все одно запускаємо: чат запам'ятається при першому використанні

@@ -103,8 +103,9 @@ def test_lesson_with_change() -> None:
     raw["zmiany"] = [{"zmiana": 7, "prowadzacy": "Wakat WAKAT", "sala": "101"}]
     raw["zmianyUwagi"] = ["Lekcja przeniesiona"]
     l = lesson_from_raw(raw)
-    assert "🔄 Заміна вчителя: Wakat WAKAT" in l["changes"]
-    assert "🔄 Заміна кабінету: 101" in l["changes"]
+    # «було → стало»: старий вчитель/кабінет з самого уроку
+    assert "🔄 Заміна вчителя → Wakat WAKAT" in l["changes"]
+    assert "🔄 Заміна кабінету → 101" in l["changes"]
     assert "ℹ️ Lekcja przeniesiona" in l["changes"]
     assert l["canceled"] is False
 
@@ -120,6 +121,85 @@ def test_lesson_canceled_notice() -> None:
     assert l["cancel_notice"] == "учнів відпустили додому"
 
 
+def test_lesson_out_of_school_is_not_canceled() -> None:
+    """zmiana=4 (вихід класу в кіно/музей) — це примітка, а НЕ відміна уроку."""
+    raw = dict(RAW_PLAIN)
+    raw["zmiany"] = [{
+        "zmiana": 4, "informacjeNieobecnosc": "Wyjście do kina ",
+    }]
+    l = lesson_from_raw(raw)
+    assert l["canceled"] is False
+    assert l["changes"] == ["📌 Wyjście do kina"]
+
+
+def test_lesson_moved_from_and_to() -> None:
+    raw_to = dict(RAW_PLAIN)
+    raw_to["zmiany"] = [{
+        "zmiana": 6, "godzinaOd": "2026-10-23T15:00:00+02:00",
+        "zajecia": "Witryny i aplikacje internetowe",
+    }]
+    assert any(c.startswith("🕒 Перенесено на 15:00")
+               for c in lesson_from_raw(raw_to)["changes"])
+
+    raw_from = dict(RAW_PLAIN)
+    raw_from["zmiany"] = [{
+        "zmiana": 5, "godzinaOd": "2026-10-23T13:15:00+02:00",
+    }]
+    assert any(c.startswith("🕒 Перенесено з 13:15")
+               for c in lesson_from_raw(raw_from)["changes"])
+
+    # обидва коди на одному уроці -> один рядок «було → стало»
+    raw_both = dict(RAW_PLAIN)
+    raw_both["zmiany"] = [
+        {"zmiana": 5, "godzinaOd": "2026-10-23T13:15:00+02:00"},
+        {"zmiana": 6, "godzinaOd": "2026-10-23T15:00:00+02:00"},
+    ]
+    assert "🕒 Перенесено: 13:15 → 15:00" in lesson_from_raw(raw_both)["changes"]
+
+
+def test_lesson_group_change() -> None:
+    raw = dict(RAW_PLAIN)
+    raw["zmiany"] = [{
+        "zmiana": 15, "zajecia": "Chemia", "grupa": "4TIR",
+    }]
+    l = lesson_from_raw(raw)
+    # показуємо ПЕРЕХІД, але без повтору назви уроку (вона вже в рядку)
+    assert "🔀 Заміна на: Chemia (4TIR)" in l["changes"]
+    # сирі дані для стабільного diff-підпису (не залежать від формулювання)
+    assert l["raw_changes"] == [["grupa=4TIR", "zajecia=Chemia", "zmiana=15"]]
+
+
+def test_raw_changes_keep_notes() -> None:
+    raw = dict(RAW_PLAIN)
+    raw["zmiany"] = [{"zmiana": 1, "informacjeNieobecnosc": "uczniowie zwolnieni"}]
+    raw["zmianyUwagi"] = ["Przynieść zeszyt"]
+    l = lesson_from_raw(raw)
+    assert l["canceled"] is True
+    # причина відміни — у сирому вигляді (переклад не впливає на підпис)
+    assert l["raw_changes"] == [["informacjeNieobecnosc=uczniowie zwolnieni", "zmiana=1"]]
+    assert l["raw_notes"] == ["Przynieść zeszyt"]
+
+
+def test_lesson_same_group_lesson_note() -> None:
+    raw = dict(RAW_PLAIN)
+    raw["zmiany"] = [{"zmiana": 15, "zajecia": "Przykładowy przedmiot", "grupa": "4TIR"}]
+    assert "🔀 Заняття разом з іншою групою (4TIR)" in lesson_from_raw(raw)["changes"]
+
+
+def test_lesson_room_change_code8() -> None:
+    raw = dict(RAW_PLAIN)
+    raw["zmiany"] = [{"zmiana": 8, "sala": "101"}]
+    assert "🔄 Заміна кабінету → 101" in lesson_from_raw(raw)["changes"]
+
+
+def test_lesson_unknown_change_code_not_lost() -> None:
+    raw = dict(RAW_PLAIN)
+    raw["zmiany"] = [{"zmiana": 99, "sala": "7"}]
+    l = lesson_from_raw(raw)
+    assert l["canceled"] is False
+    assert "🔄 Заміна кабінету → 7" in l["changes"]
+
+
 def test_format_lesson_line_canceled_strikethrough() -> None:
     raw = dict(RAW_PLAIN)
     raw["zmiany"] = [{
@@ -130,6 +210,17 @@ def test_format_lesson_line_canceled_strikethrough() -> None:
     line = format_lesson_line(8, l)
     assert line.startswith("❌ <s>8.")
     assert "відмінено: учнів відпустили додому" in line
+
+
+def test_format_lesson_line_escapes_html() -> None:
+    """'&'/'<' у даних порталу не мають ламати HTML-парсинг Telegram."""
+    raw = dict(RAW_PLAIN)
+    raw["przedmiot"] = "Matematyka & Fizyka <b>"
+    raw["prowadzacy"] = "Kowalski & Syn"
+    line = format_lesson_line(1, lesson_from_raw(raw))
+    assert "Matematyka &amp; Fizyka &lt;b&gt;" in line
+    assert "Kowalski &amp; Syn" in line
+    assert line.count("<b>") == 1 and line.count("</b>") == 1
 
 
 def test_lesson_missing_day_raises() -> None:

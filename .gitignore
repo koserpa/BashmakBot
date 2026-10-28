@@ -3,3 +3,5 @@ __pycache__/
 .env
 data/reminders.json
 data/vulcan_notify.json
+*.log
+_debug_help.py

@@ -39,6 +39,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import time
@@ -147,33 +148,139 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
     day = (item.get("data") or "")[:10]
     if not day:
         raise VulcanBadData("урок без поля 'data'")
+    subject = (item.get("przedmiot") or "").strip() or "(без назви)"
 
-    # --- розшифровка замін (тип 'zmiana', за живим трафіком портала) ---
-    #   1 = відмінено (informacjeNieobecnosc = причина, напр.
-    #       "uczniowie zwolnieni do domu" -> учнів відпустили додому)
-    #   7 = заміна вчителя (prowadzacy = хто веде)
+    # --- розшифровка замін (поле 'zmiany', коди — за живим трафіком портала) ---
+    #   1  = урок відмінено / необхідність не йти (informacjeNieobecnosc = причина,
+    #        напр. "uczniowie zwolnieni do domu" -> учнів відпустили додому)
+    #   4  = клас/група йде на захід ("Wyjście do kina", "wycieczka") — це НЕ
+    #        відміна, а примітка до уроку!
+    #   5  = урок перенесено З іншого часу (godzinaOd — звідки)
+    #   6  = урок перенесено НА інший час (godzinaOd — куди)
+    #   7  = заміна вчителя (prowadzacy = хто веде), іноді зі зміною кабінету
+    #   8  = заміна кабінету (sala = новий кабінет)
+    #   15 = зміна групи / заняття разом з іншою групою (zajecia, grupa)
+    # Невідомі коди не ігноруємо: показуємо все, що є в полях, щоб не
+    # загубити зміну, якщо портал додасть новий тип.
     canceled_notice = ""
     canceled = False
     changes: list[str] = []
+    # сирі (структурні) дані змін — для стабільного diff-підпису в
+    # vulcan_notify: правка формулювання в changes НЕ має виглядати як нова
+    # зміна (інакше бот шле дубль картки всім чатам)
+    raw_changes: list[list[str]] = []
+
+    def _add(text: str) -> None:
+        text = (text or "").strip()
+        if text and text not in changes:
+            changes.append(text)
+
+    def _swap(label: str, old: Any, new: Any) -> None:
+        """«→ нове». Старе значення вже стоїть у рядку уроку (вчитель/кабінет),
+        тому не дублюємо його — інакше картка читається як повтор."""
+        old, new = (old or "").strip(), (new or "").strip()
+        if not new:
+            return
+        _add(f"{label} → {new}" if old and old != new else f"{label}: {new}")
+
+    moved_from = moved_to = ""
+    moved_extra = ""
+
     for z in item.get("zmiany") or []:
         if not isinstance(z, dict):
             continue
-        code = z.get("zmiana")
+        raw_changes.append([
+            f"{k}={z[k]}" for k in sorted(z)
+            if not isinstance(z[k], (dict, list)) and z[k] not in (None, "")
+        ])
+        try:
+            code = int(z.get("zmiana"))
+        except (TypeError, ValueError):
+            code = None
         absent = (z.get("informacjeNieobecnosc") or "").strip()
-        if code == 1 or absent:
+        who = (z.get("prowadzacy") or "").strip()
+        sala = (z.get("sala") or "").strip()
+        zajecia = (z.get("zajecia") or "").strip()
+        grupa = (z.get("grupa") or "").strip().lstrip("|").strip()
+        # для 5/6 портал кладе в godzinaOd «інший» час (звідки/куди) —
+        # збираємо його в акумулятори нижче, а не перезаписуємо щоцикл.
+
+        if code == 1:
             canceled = True
             if absent and not canceled_notice:
                 canceled_notice = _translate_notice(absent)
+            continue
+
+        if code == 4:
+            # вихід класу/групи (кіно, музей, екскурсія) — урок не скасовано
+            if absent:
+                _add(f"📌 {absent}")
+            continue
+
+        if code == 5:                       # перенесено З
+            moved_from = moved_from or _hhmm(z.get("godzinaOd"))
+            if zajecia and zajecia != subject:
+                moved_extra = zajecia
+            continue
+
+        if code == 6:                       # перенесено НА
+            moved_to = moved_to or _hhmm(z.get("godzinaOd"))
+            if zajecia and zajecia != subject:
+                moved_extra = zajecia
+            continue
+
         if code == 7:
-            who = (z.get("prowadzacy") or "").strip()
-            if who:
-                changes.append(f"🔄 Заміна вчителя: {who}")
-            sala = (z.get("sala") or "").strip()
-            if sala:
-                changes.append(f"🔄 Заміна кабінету: {sala}")
-    for n in item.get("zmianyUwagi") or []:
-        if isinstance(n, str) and n.strip():
-            changes.append(f"ℹ️ {n.strip()}")
+            _swap("🔄 Заміна вчителя", item.get("prowadzacy"), who)
+            _swap("🔄 Заміна кабінету", item.get("sala"), sala)
+            if absent:
+                _add(f"ℹ️ {absent}")
+            continue
+
+        if code == 8:
+            _swap("🔄 Заміна кабінету", item.get("sala"), sala)
+            if not sala and absent:
+                _add(f"ℹ️ {absent}")
+            continue
+
+        if code == 15:
+            # 15 = заняття разом з іншою групою: свій предмет уже в рядку уроку,
+            # тому показуємо тільки НА що заміна (без повтору назви).
+            suffix = f" ({grupa})" if grupa else ""
+            if zajecia and zajecia != subject:
+                _add(f"🔀 Заміна на: {zajecia}{suffix}")
+            elif zajecia:
+                _add(f"🔀 Заняття разом з іншою групою{suffix}")
+            elif grupa:
+                _add(f"🔀 Зміна групи: {grupa}")
+            elif absent:
+                _add(f"ℹ️ {absent}")
+            continue
+
+        # невідомий код — краще показати хоч щось, ніж промовчати
+        if absent:
+            _add(f"ℹ️ {absent}")
+        _swap("🔄 Заміна вчителя", item.get("prowadzacy"), who)
+        _swap("🔄 Заміна кабінету", item.get("sala"), sala)
+        if zajecia:
+            _add(f"🔀 {zajecia}" + (f" ({grupa})" if grupa else ""))
+        if not (absent or who or sala or zajecia):
+            _add(f"ℹ️ Зміна в плані (typ {code})" if code is not None else "ℹ️ Зміна в плані")
+
+    if moved_from or moved_to:
+        where = f" ({moved_extra})" if moved_extra else ""
+        if moved_from and moved_to and moved_from != moved_to:
+            _add(f"🕒 Перенесено: {moved_from} → {moved_to}{where}")
+        elif moved_from:
+            _add(f"🕒 Перенесено з {moved_from}{where}")
+        else:
+            _add(f"🕒 Перенесено на {moved_to}{where}")
+
+    raw_notes = [
+        n.strip() for n in (item.get("zmianyUwagi") or [])
+        if isinstance(n, str) and n.strip()
+    ]
+    for n in raw_notes:
+        _add(f"ℹ️ {n}")
 
     group = (item.get("podzial") or "").strip().lstrip("|").strip()
 
@@ -181,11 +288,13 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
         "date": day,
         "start": _hhmm(item.get("godzinaOd")),
         "end": _hhmm(item.get("godzinaDo")),
-        "subject": (item.get("przedmiot") or "").strip() or "(без назви)",
+        "subject": subject,
         "teacher": (item.get("prowadzacy") or "").strip(),
         "room": (item.get("sala") or "").strip(),
         "group": group,
         "changes": changes,
+        "raw_changes": raw_changes,
+        "raw_notes": raw_notes,
         "canceled": canceled,
         "cancel_notice": canceled_notice,
         "realized": bool(item.get("zrealizowane")),
@@ -195,8 +304,14 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
 # Часті польські формулювання причин/rозпису -> українською (для зрозумілості)
 _NOTICE_TRANSLATIONS = {
     "uczniowie zwolnieni do domu": "учнів відпустили додому",
+    "uczniowie zwolnieni": "учнів відпустили",
     "zajęcia odwołane": "заняття відмінено",
+    "zajecia odwołane": "заняття відмінено",
     "lekcja odwołana": "урок відмінено",
+    "okienko dla uczniów": "вікно — уроку не буде",
+    "okienko dla uczniow": "вікно — уроку не буде",
+    "nieobecność nauczyciela": "немає вчителя",
+    "nieobecnosc nauczyciela": "немає вчителя",
 }
 
 
@@ -212,25 +327,28 @@ def _translate_notice(notice: str) -> str:
 def format_lesson_line(idx: int, l: dict) -> str:
     t = f"<code>{l['start']}-{l['end']}</code>" if l["start"] and l["end"] else "<code>--:--</code>"
     canceled = bool(l.get("canceled"))
+    # дані з порталу екрануємо: '&' або '<' у назві інакше ламає HTML-парсинг
+    # Telegram (повідомлення відхиляється цілком -> заміна не доходить).
+    esc = lambda v: html.escape(str(v), quote=False)
 
-    parts = [f"<b>{l['subject']}</b>"]
+    parts = [f"<b>{esc(l['subject'])}</b>"]
     if l["group"]:
-        parts.append(f"({l['group']})")
+        parts.append(f"({esc(l['group'])})")
     if l["teacher"]:
-        parts.append(f"— {l['teacher']}")
+        parts.append(f"— {esc(l['teacher'])}")
     if l["room"]:
-        parts.append(f"[каб. {l['room']}]")
+        parts.append(f"[каб. {esc(l['room'])}]")
     main = " ".join(parts)
     line = f"{idx}. {t} {main}"
 
     if canceled:
         line = f"❌ <s>{idx}. {t} {main}</s>"
         if l.get("cancel_notice"):
-            line += f"\n      ↳ відмінено: {l['cancel_notice']}"
+            line += f"\n      ↳ відмінено: {esc(l['cancel_notice'])}"
         else:
             line += "\n      ↳ заняття відмінено"
     for c in l["changes"]:
-        line += f"\n      {c}"
+        line += f"\n      {esc(c)}"
     return line
 
 
