@@ -11,6 +11,8 @@ import re
 import time
 from zoneinfo import ZoneInfo
 
+import state_store
+
 log = logging.getLogger("Bashma4ek_Bot.reminders")
 
 TZ = ZoneInfo("Europe/Warsaw")
@@ -44,6 +46,27 @@ def _save() -> None:
             json.dump(_reminders, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.error(f"Помилка збереження нагадувань у {REMINDERS_FILE}: {e}")
+    # дублюємо в Telegram-снапшот (Koyeb Free: data/ ефемерний)
+    state_store.request_save()
+
+
+def _apply_external_reminders(data) -> None:
+    """Setter для state_store: нагадування з Telegram-снапшоту."""
+    global _reminders, _loaded
+    if not isinstance(data, list):
+        raise ValueError("reminders: очікую список")
+    _reminders = [r for r in data if isinstance(r, dict)]
+    _loaded = True
+
+
+def _get_reminders_for_snapshot() -> list[dict]:
+    """Getter для state_store: спершу гарантуємо, що локальний файл прочитано."""
+    _ensure_loaded()
+    return list(_reminders)
+
+
+state_store.register("reminders", _get_reminders_for_snapshot,
+                     _apply_external_reminders)
 
 
 def _next_id() -> int:

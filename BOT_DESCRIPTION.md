@@ -84,6 +84,14 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
    - `text_utils.py` - Text processing helpers (mention extraction, trigger stripping)
    - `features.py` - Feature flag management (voice replies, unprompted reactions, etc.)
 
+### Persistent State (`state_store.py`)
+- On Koyeb Free the container disk is ephemeral, so `data/*.json` is only a cache and disappears on redeploy/cold start.
+- The bot keeps a single `bashmak-state.json` pinned in its private chat with the owner (`STATE_CHAT_ID`): VULCAN baseline + lesson signatures + notified event ids, and the reminder list.
+- On start it reads `getChat(STATE_CHAT_ID).pinned_message.document` → `getFile` → `download_file` and applies known sections; modules register sections via `state_store.register(name, getter, setter)`.
+- Updates use `editMessageMedia` on the same message (no new messages, no notifications, throttled); if the pinned message was deleted/unpinned, a new document is sent and pinned.
+- Network/broken-JSON errors never overwrite a good snapshot; the background loop retries. Without `STATE_CHAT_ID` the store is a no-op.
+- The snapshot contains no tokens/passwords/cookies; its status is exposed in `/health` under `state`.
+
 ## Key Features & Behaviors
 
 ### Conversational Intelligence
@@ -110,7 +118,7 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 4. **Reminder System** - /remind command to set time-based reminders in chat
 5. **Date Synchronization** - Periodically updates current date from internet source
 6. **Health Server** - Minimal HTTP endpoint for platforms requiring web service (Koyeb)
-7. **VULCAN Schedule Notifications** - Every 15 min polls the student's VULCAN portal and posts schedule changes to the chat: cancellations, teacher/room substitutions, moved lessons, group changes and class outings. Detects changes by diffing lesson signatures against a local snapshot; on a fresh deploy it still reports current changes instead of silently seeding a baseline. Also sends a morning digest and day-before exam/homework reminders (`vulcan_notify.py`). Change cards list the teacher (and room) next to each lesson, show only the new value in the change line (no duplicated old value or lesson name), and group all of a lesson's changes into one bullet.
+7. **VULCAN Schedule Notifications** - Every 15 min polls the student's VULCAN portal and posts schedule changes to the chat: cancellations, teacher/room substitutions, moved lessons, group changes and class outings. Detects changes by diffing lesson signatures against a snapshot; on a fresh deploy it still reports current changes instead of silently seeding a baseline, while the baseline and notified ids are restored from the pinned Telegram snapshot so redeploys don't resend cards. Also sends a morning digest and day-before exam/homework reminders (`vulcan_notify.py`). Change cards list the teacher (and room) next to each lesson, show only the new value in the change line (no duplicated old value or lesson name), and group all of a lesson's changes into one bullet.
 
 ### Media Handling
 - **Photos**: Downloads, sends to Gemini Vision for description/analysis
@@ -124,7 +132,7 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 - Admin: `/reset` (clear chat memory), `/status` (bot stats), `/model` (AI usage), `/features` (flag status)
 
 ### Configuration & Deployment
-- Requires `.env` with: `BOT_TOKEN`, `GEMINI_API_KEY`, `GEMINI_MODEL`, optional `TAVILY_API_KEY`, `ADMIN_USERNAME`, etc.
+- Requires `.env` with: `BOT_TOKEN`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `STATE_CHAT_ID` (private chat id for the pinned state snapshot), optional `TAVILY_API_KEY`, `ADMIN_USERNAME`, etc.
 - Deployable to platforms like Koyeb (including free-tier; health server satisfies port requirement)
 - Uses background asyncio tasks for watchers (non-blocking)
 - Rate limiting aware: skips non-essential searches when approaching API limits

@@ -19,6 +19,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from datetime import date, datetime, timezone
 
 import vulcan_utils as vu
@@ -335,7 +336,7 @@ def test_client_stale_plan_fallback() -> None:
             {"key": "K1", "dataOd": ts_from, "dataDo": ts_to, "zakresDanych": "2"}.items()
         )
     )
-    client._cache[ck] = (0.0, [dict(RAW_PLAIN)])   # when=0 -> максимально старий
+    client._cache[ck] = (time.monotonic() - 60, [dict(RAW_PLAIN)])   # хвилину тому: свіжий, але не новий
     got = client.stale_plan(date(2026, 10, 26))
     assert len(got) == 1 and got[0]["date"] == "2026-10-26"
 
@@ -350,7 +351,7 @@ def test_client_stale_plan_wrong_week() -> None:
             {"key": "K1", "dataOd": ts_from, "dataDo": ts_to, "zakresDanych": "2"}.items()
         )
     )
-    client._cache[ck] = (0.0, [dict(RAW_PLAIN)])
+    client._cache[ck] = (time.monotonic() - 60, [dict(RAW_PLAIN)])
     # інший тиждень -> не підходить
     assert client.stale_plan(date(2026, 11, 9)) == []
 

@@ -20,8 +20,9 @@ from aiogram.enums import ParseMode
 from aiohttp import web
 
 import bot_state
+import state_store
 import tasks
-from config import BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL
+from config import BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, STATE_CHAT_ID
 from handlers import idle_chat_watcher, register_handlers
 from plugins import load_plugins
 from reminder_utils import reminders_watcher
@@ -86,6 +87,7 @@ async def _start_health_server() -> None:
             "status": "degraded" if degraded else "ok",
             "uptime_sec": int(time.time() - bot_state.START_TIME),
             "vulcan": info,
+            "state": state_store.status(),
             "vulcan_poll_age_sec": age,
             "stale_after_sec": stale_after,
         }
@@ -124,6 +126,12 @@ async def main():
     log.info(f"Завантажено плагінів: {loaded}")
 
     register_handlers(dp, bot)
+
+    # Durable-стан: закріплений JSON у приватному чаті (Koyeb Free: диск
+    # ефемерний). Має стартувати ПІСЛЯ імпорту модулів (вони реєструють
+    # секції) і ДО watcher'ів, щоб вони вже бачили відновлений стан.
+    dp.shutdown.register(state_store.stop)
+    await state_store.start(bot, STATE_CHAT_ID)
 
     await _start_health_server()
 

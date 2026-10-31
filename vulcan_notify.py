@@ -34,6 +34,7 @@ log = logging.getLogger("Bashma4ek_Bot.vulcan.notify")
 TZ = ZoneInfo("Europe/Warsaw")
 
 import vulcan_utils as vu
+import state_store
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "data", "vulcan_notify.json")
 
@@ -59,6 +60,16 @@ _state: dict[str, Any] = {}
 _loaded = False
 
 
+def _apply_defaults() -> None:
+    _state.setdefault("chat_ids", [])
+    _state.setdefault("lesson_changes", {})   # ключ уроку -> підпис змін (str)
+    _state.setdefault("notified_events", {})  # id заходу -> true
+    _state.setdefault("remind_done_day", "")  # останній день веч. нагадування
+    _state.setdefault("morning_done_day", "") # останній день ранкового дайджеста
+    _state.setdefault("muted_chats", [])      # чати, що запросили тишину
+    _state.setdefault("fail_counts", {})      # chat_id -> поспіль невдалих відправок
+
+
 def _ensure_loaded() -> None:
     global _loaded, _state
     if _loaded:
@@ -71,13 +82,28 @@ def _ensure_loaded() -> None:
         except Exception as e:
             log.error(f"не вдалось прочитати {STATE_FILE}: {e}")
             _state = {}
-    _state.setdefault("chat_ids", [])
-    _state.setdefault("lesson_changes", {})   # ключ уроку -> підпис змін (str)
-    _state.setdefault("notified_events", {})  # id заходу -> true
-    _state.setdefault("remind_done_day", "")  # останній день веч. нагадування
-    _state.setdefault("morning_done_day", "") # останній день ранкового дайджеста
-    _state.setdefault("muted_chats", [])      # чати, що запросили тишину
-    _state.setdefault("fail_counts", {})      # chat_id -> поспіль невдалих відправок
+    _apply_defaults()
+
+
+def _apply_external_state(data: Any) -> None:
+    """Setter для state_store: стан із Telegram-снапшоту замінює локальний."""
+    global _loaded
+    if not isinstance(data, dict):
+        raise ValueError("vulcan_notify: очікую об'єкт")
+    _state.clear()
+    _state.update(data)
+    _apply_defaults()
+    _loaded = True
+
+
+def _get_state_for_snapshot() -> dict[str, Any]:
+    """Getter для state_store: спершу гарантуємо, що локальний файл прочитано."""
+    _ensure_loaded()
+    return _state
+
+
+state_store.register("vulcan_notify", _get_state_for_snapshot,
+                     _apply_external_state)
 
 
 def _save() -> None:
@@ -90,6 +116,8 @@ def _save() -> None:
             json.dump(_state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.error(f"не вдалось зберегти {STATE_FILE}: {e}")
+    # дублюємо в Telegram-снапшот (Koyeb Free: data/ ефемерний)
+    state_store.request_save()
 
 
 # Скільки днів тримати позначку «про цю подію вже сповіщались».

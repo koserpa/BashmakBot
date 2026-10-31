@@ -32,13 +32,16 @@
 **Що з цього випливає для коду:**
 
 - не робити ставку на `data/*.json` як на довготривале сховище. Для пам'яті
-  та стану між редеплоями потрібен зовнішній безкоштовний store
-  (Neon/Supabase Postgres, Upstash Redis) або снапшот стану в приватний
-  Telegram-чат. Локальний `data/` — лише кеш на час життя інстансу;
-- `VULCAN_NOTIFY_CHATS` — обов'язковий env: єдине, що гарантовано переживає
-  редеплой (id групового чату);
-- baseline скидається після кожного редеплою/cold start → перший цикл може
-  один раз надіслати поточні зміни. Це by design (див. §7);
+  та стану між редеплоями використовується **снапшот стану в приватному
+  Telegram-чаті** (`state_store.py`, див. §4.1): один закріплений документ
+  `bashmak-state.json`, який бот оновлює через `editMessageMedia`. Локальний
+  `data/` — лише кеш на час життя інстансу;
+- `VULCAN_NOTIFY_CHATS` — обов'язковий env: список цільових чатів; разом зі
+  снапшотом це те, що гарантовано переживає редеплой;
+- baseline VULCAN, підписи уроків і `notified_events` тепер відновлюються зі
+  снапшоту, тож після редеплою/cold start дублів карток немає. Якщо снапшот
+  недоступний (перший запуск, видалений пін) — поведінка стара: baseline
+  сідає з поточного стану, але наявні зміни на сьогодні й далі надсилаються;
 - історія чату живе в RAM: тримати її обмеженою за кількістю повідомлень
   і символів, бо 512 MB не гумові;
 - не додавати важкі залежності (моделі, ffmpeg-обробку великих файлів,
@@ -71,6 +74,8 @@ $env:PYTHONIOENCODING="utf-8"; & "$env:LOCALAPPDATA\Programs\Python\Python313\py
 ### Тести
 - `test_vulcan_autologin.py` — офлайн-тести парсерів + `--live-fake` (фейкові creds; сервер відповідає "nazwa użytkownika lub hasło są błędne" = PoW прийнято).
 - `test_vulcan_utils.py`, `smoke_test_plugins.py` — офлайн-смоуки.
+- `test_state_store.py`, `test_vulcan_notify.py`, `test_text_utils.py` — офлайн,
+  без мережі й без `.env` (CI проганяє всі `test_*.py`).
 
 ---
 
@@ -93,6 +98,33 @@ $env:PYTHONIOENCODING="utf-8"; & "$env:LOCALAPPDATA\Programs\Python\Python313\py
   **Кнопки**: під карткою дня/тижня inline-кнопки (завтра/тиждень/sprawdziany),
   callback-хендлер `on_vulcan_callback` ловить `vulcan:*`.
 - `hello.py`, `funny.py`, `action.py` — дрібні розваги/привітання.
+
+### Довготривалий стан — `state_store.py` (31.10.2026)
+Koyeb Free: диск ефемерний → `data/*.json` не переживає редеплой. Тому стан
+дублюється в **один JSON-документ, закріплений у приватному чаті з ботом**
+(`STATE_CHAT_ID`, зараз `5828060936`):
+
+- `bashmak-state.json` = `{v, saved_at, sections: {ім'я: дані}}`;
+- модулі реєструють свої секції: `state_store.register("vulcan_notify", getter, setter)`
+  (зараз `vulcan_notify` і `reminders`); невідомі секції при відновленні ігноруються;
+- старт: `getChat(STATE_CHAT_ID).pinned_message.document` → `getFile` → `download_file`
+  → `_apply`. Якщо піна немає — створюємо документ і пінимо; якщо читання впало
+  (мережа, битий JSON) — **не перезаписуємо** добрий стан, фоновий цикл повторює;
+- оновлення: `editMessageMedia` того ж повідомлення (без нових повідомлень і
+  пушів), throttle `STATE_SAVE_MIN_SEC` (10 с); при `TelegramBadRequest`
+  (видалили/відкріпили) — новий документ + пін, старий видаляється;
+- `start(bot, STATE_CHAT_ID)` викликається в `bot.py` **після** імпорту плагінів
+  (вони реєструють секції) і **до** watcher'ів; `stop()` — flush на SIGTERM;
+- без `STATE_CHAT_ID` — no-op, працює тільки локальний `data/`;
+- у снапшот **не** потрапляють токени/паролі/куки — тільки те, що віддають getter'и;
+- статус видно в `/health` → `state` (`configured`, `pinned`, `synced`, `dirty`,
+  `restored_at`, `last_save_at`, `last_error`, `sections`).
+
+Перевірено живим рестартом: seed → pinned-документ у DM → видалення
+`data/vulcan_notify.json` → рестарт → `state: відновлено з Telegram` (2 секції,
+39 уроків, той самий `pinned=500`), дублів карток немає.
+Тести: `test_state_store.py` (7: фейковий бот, без мережі: seed/edit, відновлення,
+помилка мережі, битий JSON, перестворення піна, чужий закріплений документ, no-op).
 
 ### Головний чат (Gemini)
 - `handlers.py` — реєстрація хендлерів, watcher простою; help-текст.
@@ -173,10 +205,12 @@ keepalive_watcher не стартує, коли notify увімкнено (`VULC
    1=відмінено, 4=вихід класу/групи (НЕ відміна!), 5/6=перенесено з/на,
    7=заміна вчителя (іноді + кабінет), 8=заміна кабінету, 15=заняття з іншою
    групою; невідомі коди теж показуємо, а не губимо.
-   Перший запуск (на Koyeb `data/` ephemeral → файлу немає) зберігає baseline,
-   але **поточні зміни на сьогодні й далі надсилає** (раніше тихо ковтав —
-   заміни, зроблені до старту бота, не приходили ніколи). Якщо картку не
-   вдалося доставити — підписи не фіксуються, буде повтор наступного циклу.
+   Перший запуск (немає ні снапшоту, ні `data/vulcan_notify.json`) зберігає
+   baseline, але **поточні зміни на сьогодні й далі надсилає** (раніше тихо
+   ковтав — заміни, зроблені до старту бота, не приходили ніколи). Якщо картку
+   не вдалося доставити — підписи не фіксуються, буде повтор наступного циклу.
+   Після редеплою baseline і підписи відновлюються зі снапшоту (§3), тому
+   дублів немає.
    **Нічна пауза 00:00–06:00** (Варшава) — цикли пропускаються.
 2. **Ранковий дайджест** (`VULCAN_MORNING_HOUR:MINUTE`, default 6:50):
    розклад на сьогодні + події сьогодні, раз на день (`morning_done_day`).
@@ -200,9 +234,9 @@ keepalive_watcher не стартує, коли notify увімкнено (`VULC
 6. Цілі-чати: env `VULCAN_NOTIFY_CHATS` (через кому) АБО чати, де використовували
    розклад/sprawdziany (авто-запам'ятовування). **Мертві чати**: 10 послідовних
    невдалих send'ів (`fail_counts`) → авто-виключення зі списку цілей.
-   ⚠️ `data/` на Koyeb ефемерний: `chat_ids` із файлу зникають при кожному
-   редеплої. Тому груповий чат треба прописати у `VULCAN_NOTIFY_CHATS`
-   (env переживає редеплой; `_target_chats()` мержить env + файл).
+   ⚠️ `data/` на Koyeb ефемерний, але `chat_ids` тепер їдуть у снапшоті
+   (§3), тож після редеплою не губляться; `VULCAN_NOTIFY_CHATS` лишається
+   страховкою (env переживає все; `_target_chats()` мержить env + файл).
 
 ### Живі API-ендпоінти вебпорталу (програв маршрут Chrome, 27.10.2026)
 ```
@@ -244,6 +278,8 @@ GET /api/*Tablica (SprawdzianyTablica, ZadaniaDomoweTablica, WazneDzisiaj...) ->
 | `VULCAN_REMIND_HOUR` | година (Варшава) нагадування про завтрашні sprawdzian/дз (18) |
 | `VULCAN_MORNING_HOUR[_MINUTE]` | ранковий дайджест «розклад на сьогодні» (6:50) |
 | `VULCAN_NOTIFY` | `false` — вимкнути всі проактивні сповіщення (штатний keepalive повертається) |
+| `STATE_CHAT_ID` | ⚠️ **обов'язково на Koyeb**: приватний chat_id, де закріплено `bashmak-state.json` (5828060936); без нього стан живе тільки в ефемерному `data/` |
+| `STATE_SAVE_MIN_SEC` | мінімальний інтервал між оновленнями снапшоту в Telegram (10) |
 | `PORT` | порт health-сервера (8000) |
 | `ADMIN_USERNAME` | `koserpa` |
 | `TRIGGER_NAMES` | імена-тригери бота (⚠️ обов'язково на Koyeb Secrets — без нього name-тригери мовчать) |
@@ -259,7 +295,10 @@ GET /api/*Tablica (SprawdzianyTablica, ZadaniaDomoweTablica, WazneDzisiaj...) ->
 - План: Starter / Free instance — **512МБ RAM, 0.1 vCPU** → Playwright/Chromium
   НЕМОЖЛИВО (OOM), тільки чистий HTTP (curl_cffi — ок, легковагий).
 - Health-check: `GET /health` на `PORT` — тримати активним (інакше scale-to-zero).
-- На Koyeb Secrets додати: `VULCAN_LOGIN`, `VULCAN_PASSWORD` (все інше вже є).
+  JSON містить `state` (снапшот стану) і `vulcan` (baseline, targets, останній poll).
+- На Koyeb Secrets додати: `VULCAN_LOGIN`, `VULCAN_PASSWORD`, **`STATE_CHAT_ID`**
+  (решта вже є). Без `STATE_CHAT_ID` бот працює, але після кожного редеплою
+  втрачає baseline і може надіслати поточні зміни повторно.
   `curl-cffi` підтягнеться з `requirements.txt` при деплої.
 - Контейнер ephemeral: після рестарту `VULCAN_COOKIES` з env може бути протухлою —
   перший же `/rozklad` або keepalive (20хв) автологіном оновить сесію. Це штатний потік.
@@ -367,3 +406,15 @@ GET /api/*Tablica (SprawdzianyTablica, ZadaniaDomoweTablica, WazneDzisiaj...) ->
   безпечний parse retry-after (429, кап 90с); /status розширено (квоти, чати,
   живі циклі); reminder-parser приймає кириличні «30м/45с/2 днів» (був тьхий
   bug: «днів» давав 0); оффлайн-тести `test_text_utils.py` (у CI теж).
+- **Довготривалий стан у Telegram (31.10.2026):** `state_store.py` — один
+  закріплений `bashmak-state.json` у приватному чаті (`STATE_CHAT_ID`),
+  секції `vulcan_notify` + `reminders`, оновлення через `editMessageMedia`,
+  відновлення на старті через `pinned_message`. `/health` показує `state`.
+  Живий тест: seed → видалення `data/vulcan_notify.json` → рестарт →
+  відновлено 39 уроків і baseline з Telegram, `pinned=500`, дублів немає;
+  повторний рестарт після edit теж читає оновлений снапшот. Тести:
+  `test_state_store.py` (7) + усі існуючі зелені.
+  ⚠️ На Koyeb треба додати `STATE_CHAT_ID=5828060936` у Secrets.
+  Також виправлено флакі `test_client_stale_plan_fallback`: кеш тепер
+  `time.monotonic() - 60` замість `0.0` (на Windows з довгим uptime `0.0`
+  виглядав старішим за 7-денний `_STALE_GRACE`).

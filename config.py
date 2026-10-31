@@ -20,6 +20,11 @@ TRIGGER_NAMES = [n.strip() for n in os.getenv(
 
 HISTORY_SIZE = int(os.getenv("HISTORY_SIZE", "100"))
 
+# STATE_CHAT_ID — приватний чат, у якому бот тримає закріплений JSON-снапшот
+# стану (baseline VULCAN, нагадування). На Koyeb Free диск ефемерний, тож
+# це єдине довготривале сховище. 0/порожньо = вимкнено (лишається data/).
+STATE_CHAT_ID = int(os.getenv("STATE_CHAT_ID", "0") or "0")
+
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
 TTS_VOICE_NAME = os.getenv("TTS_VOICE_NAME", "Kore")
 # Фіча-флаги (VOICE_REPLY_ENABLED і решта) тепер живуть в features.py —
