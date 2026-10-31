@@ -126,6 +126,13 @@ Koyeb Free: диск ефемерний → `data/*.json` не пережива�
 Тести: `test_state_store.py` (7: фейковий бот, без мережі: seed/edit, відновлення,
 помилка мережі, битий JSON, перестворення піна, чужий закріплений документ, no-op).
 
+**Історія чатів + сумаризація (31.10, додано):** `bot_state.py` — секція
+`chat_history` в снапшоті (`summary` + `recent`, max 20 msg); при >40 msg
+старі стискаються через Gemini в `summary`; `get_history()` повертає
+`summary + recent` для LLM-контексту; фоновий `history_flusher` зберігає
+dirty-історію кожні 30 с. Env: `HISTORY_PERSIST_ENABLED`, `HISTORY_SUMMARY_THRESHOLD=40`,
+`HISTORY_RECENT_KEEP=20`, `HISTORY_SAVE_MIN_SEC=30`.
+
 ### Головний чат (Gemini)
 - `handlers.py` — реєстрація хендлерів, watcher простою; help-текст.
 - `search_utils.py` — Tavily-пошук + підмішування **реального розкладу в LLM-контекст**
@@ -279,6 +286,9 @@ GET /api/*Tablica (SprawdzianyTablica, ZadaniaDomoweTablica, WazneDzisiaj...) ->
 | `VULCAN_MORNING_HOUR[_MINUTE]` | ранковий дайджест «розклад на сьогодні» (6:50) |
 | `VULCAN_NOTIFY` | `false` — вимкнути всі проактивні сповіщення (штатний keepalive повертається) |
 | `STATE_CHAT_ID` | ⚠️ **обов'язково на Koyeb**: приватний chat_id, де закріплено `bashmak-state.json` (5828060936); без нього стан живе тільки в ефемерному `data/` |
+| `HISTORY_SUMMARY_THRESHOLD` | поріг сумаризації історії чату (40 msg) |
+| `HISTORY_RECENT_KEEP` | скільки останніх msg тримати в повному вигляді (20) |
+| `HISTORY_SAVE_MIN_SEC` | інтервал збереження історії в Telegram (30) |
 | `STATE_SAVE_MIN_SEC` | мінімальний інтервал між оновленнями снапшоту в Telegram (10) |
 | `PORT` | порт health-сервера (8000) |
 | `ADMIN_USERNAME` | `koserpa` |
