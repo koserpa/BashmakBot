@@ -91,6 +91,7 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 - Updates use `editMessageMedia` on the same message (no new messages, no notifications, throttled); if the pinned message was deleted/unpinned, a new document is sent and pinned.
 - Network/broken-JSON errors never overwrite a good snapshot; the background loop retries. Without `STATE_CHAT_ID` the store is a no-op.
 - The snapshot contains no tokens/passwords/cookies; its status is exposed in `/health` under `state`.
+- Chat history (`bot_state.py`) is also persisted via `state_store`: per chat `{summary, recent}`; when `recent` exceeds `HISTORY_SUMMARY_THRESHOLD` (40 messages), older messages are compressed into `summary` by Gemini. Config: `HISTORY_PERSIST_ENABLED`, `HISTORY_SUMMARY_THRESHOLD`, `HISTORY_RECENT_KEEP`, `HISTORY_SAVE_MIN_SEC`.
 
 ## Key Features & Behaviors
 
