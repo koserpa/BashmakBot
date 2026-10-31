@@ -130,7 +130,9 @@ async def main():
     # ефемерний). Має стартувати ПІСЛЯ імпорту модулів (вони реєструють
     # секції) і ДО watcher'ів, щоб вони вже бачили відновлений стан.
     dp.shutdown.register(state_store.stop)
+    dp.shutdown.register(bot_state.stop_history_persistence)
     await state_store.start(bot, STATE_CHAT_ID)
+    await bot_state.start_history_persistence()
 
     await _start_health_server()
 

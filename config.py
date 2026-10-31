@@ -20,6 +20,17 @@ TRIGGER_NAMES = [n.strip() for n in os.getenv(
 
 HISTORY_SIZE = int(os.getenv("HISTORY_SIZE", "100"))
 
+# Chat history persistence & summarization (state_store + LLM compression)
+# Якщо STATE_CHAT_ID задано — історія чатів автоматично зберігається в
+# закріплений Telegram-снапшот і відновлюється після редеплою.
+HISTORY_PERSIST_ENABLED = os.getenv("HISTORY_PERSIST_ENABLED", "true").lower() != "false"
+# Коли історія перевищує цей поріг — запускаємо сумаризацію старих повідомлень.
+HISTORY_SUMMARY_THRESHOLD = int(os.getenv("HISTORY_SUMMARY_THRESHOLD", "40") or "40")
+# Скільки останніх повідомлень тримати в повному вигляді (решта йде в summary).
+HISTORY_RECENT_KEEP = int(os.getenv("HISTORY_RECENT_KEEP", "20") or "20")
+# Мінімальний інтервал між збереженнями історії в state_store (сек).
+HISTORY_SAVE_INTERVAL_SEC = int(os.getenv("HISTORY_SAVE_INTERVAL_SEC", "30") or "30")
+
 # STATE_CHAT_ID — приватний чат, у якому бот тримає закріплений JSON-снапшот
 # стану (baseline VULCAN, нагадування). На Koyeb Free диск ефемерний, тож
 # це єдине довготривале сховище. 0/порожньо = вимкнено (лишається data/).

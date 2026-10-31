@@ -290,7 +290,7 @@ async def maybe_intervene_drama(bot: Bot, message: Message) -> None:
 
     drama_utils.mark_drama_handled(chat_id)  # одразу, щоб не задвоїти
 
-    recent_history = list(bot_state.history[chat_id])[-12:]
+    recent_history = bot_state.get_history(chat_id)[-12:]
     prompt = (
         "[СИСТЕМНЕ]: у чаті зараз накал — люди сваряться. Напиши ОДНЕ коротке "
         "речення: розряди обстановку легким необразливим жартом або нейтральним "
@@ -309,7 +309,7 @@ async def maybe_intervene_drama(bot: Bot, message: Message) -> None:
         return
 
     answer = strip_name_prefix(answer, "", bot_state.BOT_FULL_NAME)
-    bot_state.history[chat_id].append({"role": "model", "parts": [{"text": answer}]})
+    bot_state.append_history(chat_id, {"role": "model", "parts": [{"text": answer}]})
     try:
         await bot.send_message(chat_id, answer)
     except Exception:
@@ -344,7 +344,7 @@ async def maybe_poke_absent_user(bot: Bot, message: Message) -> None:
         f"[Про {full_name}]: {style}"
     )
 
-    contents = list(bot_state.history[chat_id])[-10:] + [
+    contents = bot_state.get_history(chat_id)[-10:] + [
         {"role": "user", "parts": [{"text": prompt}]}
     ]
 
@@ -358,7 +358,7 @@ async def maybe_poke_absent_user(bot: Bot, message: Message) -> None:
         return
 
     answer = strip_name_prefix(answer, "", bot_state.BOT_FULL_NAME)
-    bot_state.history[chat_id].append({"role": "model", "parts": [{"text": answer}]})
+    bot_state.append_history(chat_id, {"role": "model", "parts": [{"text": answer}]})
     try:
         await bot.send_message(chat_id, answer)
     except Exception:
@@ -369,9 +369,7 @@ def remember_only(bot: Bot, message: Message, sender: str, note: str) -> None:
     """Записує подію в історію чату без звернення до Gemini (коли бота не
     згадали). Додатково запускає фонову перевірку — чи не варто все ж
     відреагувати емодзі на це повідомлення (без тегу)."""
-    bot_state.history[message.chat.id].append(
-        {"role": "user", "parts": [{"text": f"{sender}: {note}"}]}
-    )
+    bot_state.append_history(message.chat.id, {"role": "user", "parts": [{"text": f"{sender}: {note}"}]})
     spawn_background(maybe_react_unprompted(bot, message, sender, note))
 
 
@@ -380,8 +378,8 @@ async def process_and_reply(
     extra_parts: list | None = None, history_label: str | None = None,
     is_voice_input: bool = False,
 ) -> None:
-    history_label = history_label if history_label is not None else question_text
-    chat_history = bot_state.history[message.chat.id]
+    chat_id = message.chat.id
+    chat_history = bot_state.get_history(chat_id)
 
     image_was_requested = is_image_query(question_text)
     full_prompt_text = f"{sender}: {question_text}"
@@ -433,9 +431,7 @@ async def process_and_reply(
         and not tts_quota_low()
     )
 
-    chat_history.append(
-        {"role": "user", "parts": [{"text": f"{sender}: {history_label}"}]}
-    )
+    bot_state.append_history(chat_id, {"role": "user", "parts": [{"text": f"{sender}: {history_label}"}]})
 
     # Якщо запитували картинку — реакція завжди заборонена, навіть якщо
     # image_urls порожній (не знайшли фото). Модель має відповісти текстом.
@@ -458,7 +454,7 @@ async def process_and_reply(
             log.exception("Не вдалось поставити реакцію, відповідаю текстом")
             await message.reply(reaction_emoji)
     else:
-        chat_history.append({"role": "model", "parts": [{"text": answer}]})
+        bot_state.append_history(chat_id, {"role": "model", "parts": [{"text": answer}]})
         voice_sent = False
         if should_send_voice:
             voice_sent = await _send_voice_reply(bot, message.chat.id, answer, message.message_id)
@@ -505,7 +501,7 @@ async def dispatch_media_event(
 
 async def send_idle_message(bot: Bot, chat_id: int) -> None:
     """Формує і надсилає одне проактивне повідомлення в тихий чат."""
-    chat_history = bot_state.history[chat_id]
+    chat_history = bot_state.get_history(chat_id)
     contents = list(chat_history)
     idle_hours = float(os.getenv("IDLE_HOURS", "7"))
     contents.append(
@@ -528,7 +524,7 @@ async def send_idle_message(bot: Bot, chat_id: int) -> None:
         return
 
     answer = strip_name_prefix(answer, "", bot_state.BOT_FULL_NAME)
-    chat_history.append({"role": "model", "parts": [{"text": answer}]})
+    bot_state.append_history(chat_id, {"role": "model", "parts": [{"text": answer}]})
     await bot.send_message(chat_id, answer)
 
 
@@ -624,7 +620,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
 
     @dp.message(Command("reset"), IsAdmin())
     async def cmd_reset(message: Message):
-        bot_state.history[message.chat.id].clear()
+        bot_state.clear_history(message.chat.id)
         await message.answer("Пам'ять цього чату очищена 🧹")
 
     @dp.message(Command("status"), IsAdmin())
@@ -633,8 +629,8 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
 
         uptime_sec = int(time.time() - bot_state.START_TIME)
         uptime = f"{uptime_sec // 3600}г {uptime_sec % 3600 // 60}хв {uptime_sec % 60}с"
-        chat_len = len(bot_state.history[message.chat.id])
-        total_chats = len(bot_state.history)
+        chat_len = bot_state.history_len(message.chat.id)
+        total_chats = len(bot_state._history)
 
         lines = [
             "📊 <b>Статус бота</b>",
@@ -678,7 +674,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
     async def cmd_gadalka(message: Message):
         sender = message.from_user.full_name if message.from_user else "Хтось"
         context = get_public_context(message)  # лише style, без sensitive
-        recent = list(bot_state.history[message.chat.id])[-10:]
+        recent = bot_state.get_history(message.chat.id)[-10:]
 
         prompt = (
             f"Зіграй містичну гадалку. Зроби коротке (1-2 речення) смішне, "
