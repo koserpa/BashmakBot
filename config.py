@@ -84,6 +84,18 @@ VULCAN_NOTIFY_CHATS = [
 ]
 # VULCAN_CHANGES_POLL_MIN — як часто перевіряти розклад на нові заміни (хв).
 VULCAN_CHANGES_POLL_MIN = int(os.getenv("VULCAN_CHANGES_POLL_MIN", "15") or "15")
+# VULCAN_GRADES_ENABLED — проактивні сповіщення про нові/змінені оцінки.
+VULCAN_GRADES_ENABLED = os.getenv("VULCAN_GRADES_ENABLED", "true").lower() not in (
+    "0", "false", "no", "off",
+)
+# VULCAN_GRADES_CHATS — куди слати оцінки (chat_id через кому).
+# Порожньо = тільки STATE_CHAT_ID (особистий чат власника). Оцінки —
+# персональні дані, тому в групи за замовчуванням НЕ йдуть.
+VULCAN_GRADES_CHATS = [
+    s.strip() for s in os.getenv("VULCAN_GRADES_CHATS", "").split(",") if s.strip()
+]
+# VULCAN_GRADES_POLL_MIN — як часто перевіряти оцінки (хв).
+VULCAN_GRADES_POLL_MIN = int(os.getenv("VULCAN_GRADES_POLL_MIN", "15") or "15")
 # VULCAN_REMIND_HOUR — година (Варшава) вечірнього нагадування про завтрашні
 # sprawdziany/картківки/дз. Немає завтрашніх подій -> повідомлення не шлється.
 VULCAN_REMIND_HOUR = int(os.getenv("VULCAN_REMIND_HOUR", "18") or "18")

@@ -1,6 +1,6 @@
 """Проактивні сповіщення VULCAN для чату.
 
-Дві фічі (обидві — фоновими watcher'ами, жодних запитів від користувача):
+Три фічі (всі — фоновими watcher'ами, жодних запитів від користувача):
 
 1. ЗМІНИ В РОЗКЛАДІ (заміни/відміни/примітки)
    Кожні VULCAN_CHANGES_POLL_MIN хвилин тягнемо розклад на найближчі 7 днів
@@ -13,8 +13,15 @@
    /api/SprawdzianyZadaniaDomowe на завтра: sprawdzian (typ=1), kartkówka (typ=2),
    praca klasowa (typ=3), zadanie domowe (typ=4). Якщо є — картка «Завтра ...».
 
-Кому слати: змінна VULCAN_NOTIFY_CHATS (chat_id через кому) АБО чати,
-де хтось користувався /розклад (запам'ятовуються в data/vulcan_notify.json).
+3. ОЦІНКИ (з 03.11.2026)
+   Кожні VULCAN_GRADES_POLL_MIN хв тягнемо /api/Oceny за поточний семестр,
+   порівнюємо підписи (предмет + idKolumny + індекс; значення/вага/дата/
+   вчитель) і шлемо в особистий чат нові, виправлені та видалені оцінки.
+   Перший запуск/новий семестр — тихий seed. Куди: VULCAN_GRADES_CHATS,
+   порожньо = STATE_CHAT_ID.
+
+Кому слати зміни розкладу: змінна VULCAN_NOTIFY_CHATS (chat_id через кому) АБО
+чати, де хтось користувався /розклад (запам'ятовуються в data/vulcan_notify.json).
 
 Безпека: у логах ніяких куків/ключів/вмісту — тільки факти і статуси.
 """
@@ -24,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import date, datetime, timedelta
 from html import escape as _esc
 from typing import Any
@@ -68,6 +76,9 @@ def _apply_defaults() -> None:
     _state.setdefault("morning_done_day", "") # останній день ранкового дайджеста
     _state.setdefault("muted_chats", [])      # чати, що запросили тишину
     _state.setdefault("fail_counts", {})      # chat_id -> поспіль невдалих відправок
+    _state.setdefault("grade_signatures", {}) # ключ оцінки -> підпис
+    _state.setdefault("grade_period", None)   # id поточного періоду
+    _state.setdefault("grade_baseline", None) # коли вперше збережено базу оцінок
 
 
 def _ensure_loaded() -> None:
@@ -146,6 +157,7 @@ def _prune_notified(events: dict[str, Any], today: date) -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 LAST_POLL: dict[str, Any] = {"at": None, "ok": None, "error": "", "days": 0}
+GRADES_LAST_POLL: dict[str, Any] = {"at": None, "ok": None, "error": "", "count": 0}
 
 
 def _mark_poll(ok: bool, *, error: str = "", days: int = 0) -> None:
@@ -154,6 +166,15 @@ def _mark_poll(ok: bool, *, error: str = "", days: int = 0) -> None:
         "ok": ok,
         "error": (error or "")[:200],
         "days": days,
+    })
+
+
+def _mark_grades_poll(ok: bool, *, error: str = "", count: int = 0) -> None:
+    GRADES_LAST_POLL.update({
+        "at": datetime.now(TZ).isoformat(timespec="seconds"),
+        "ok": ok,
+        "error": (error or "")[:200],
+        "count": count,
     })
 
 
@@ -173,6 +194,13 @@ def health_info() -> dict[str, Any]:
         "last_poll_days": LAST_POLL["days"],
         "last_poll_error": LAST_POLL["error"],
         "poll_interval_min": int(config.VULCAN_CHANGES_POLL_MIN or 15),
+        "grade_targets": len(_grade_targets()),
+        "tracked_grades": len(_state.get("grade_signatures") or {}),
+        "grade_period": _state.get("grade_period"),
+        "last_grades_poll_at": GRADES_LAST_POLL["at"],
+        "last_grades_poll_ok": GRADES_LAST_POLL["ok"],
+        "last_grades_poll_error": GRADES_LAST_POLL["error"],
+        "grades_poll_interval_min": int(config.VULCAN_GRADES_POLL_MIN or 15),
     }
 
 
@@ -230,6 +258,25 @@ def _target_chats() -> list[int]:
         if cid not in out:
             out.append(int(cid))
     return [c for c in out if c not in muted]
+
+
+def _grade_targets() -> list[int]:
+    """Кому слати оцінки: VULCAN_GRADES_CHATS, інакше особистий STATE_CHAT_ID.
+
+    Навмисно НЕ використовує групи зі `_target_chats()`: оцінки — особисті
+    дані, і за замовчуванням вони не повинні потрапляти в загальний чат.
+    """
+    from config import STATE_CHAT_ID, VULCAN_GRADES_CHATS
+    raw = list(VULCAN_GRADES_CHATS) or ([STATE_CHAT_ID] if STATE_CHAT_ID else [])
+    out: list[int] = []
+    for s in raw:
+        try:
+            cid = int(s)
+        except (TypeError, ValueError):
+            continue
+        if cid and cid not in out:
+            out.append(cid)
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -370,6 +417,149 @@ def format_daybefore_card(d: date, events: list[dict]) -> str:
 
 
 # ----------------------------------------------------------------------
+# Оцінки: diff між опитуваннями + картка (тестується офлайн)
+# ----------------------------------------------------------------------
+
+def _decode_grade_signature(sig: Any) -> dict[str, Any]:
+    """Розібрати збережений підпис, щоб показати старе значення у картці."""
+    if not isinstance(sig, str):
+        return {}
+    try:
+        data = json.loads(sig)
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _compute_grade_changes(
+    entries: list[dict], stored: dict[str, str], *, seed: bool = False,
+) -> tuple[list[dict], list[tuple[dict, dict]], list[dict], dict[str, str]]:
+    """Diff поточних оцінок проти збережених підписів.
+
+    Повертає (нові, виправлені [(стара, нова)], видалені, новий map).
+    `seed=True` — перший запуск/зміна семестру: тихо запам'ятовуємо базу,
+    щоб не вивалити в чат усі 30+ старих оцінок.
+    """
+    now_map: dict[str, str] = {}
+    new: list[dict] = []
+    edited: list[tuple[dict, dict]] = []
+    for g in entries:
+        key = vu.grade_identity(g)
+        sig = vu.grade_signature(g)
+        now_map[key] = sig
+        prev = stored.get(key)
+        if prev is None:
+            if not seed:
+                new.append(g)
+        elif prev != sig:
+            old = _decode_grade_signature(prev)
+            # старі/биті підписи без полів не показуємо як «виправлення»
+            if old.get("value") is not None:
+                edited.append((old, g))
+    removed: list[dict] = []
+    if not seed:
+        for key, sig in stored.items():
+            if key in now_map:
+                continue
+            old = _decode_grade_signature(sig)
+            if old.get("subject"):
+                removed.append(old)
+    return new, edited, removed, now_map
+
+
+def _fmt_grade_weight(g: dict) -> str:
+    w = g.get("weight")
+    if w is None:
+        return ""
+    try:
+        return f"вага {float(w):g}"
+    except (TypeError, ValueError):
+        return f"вага {w}"
+
+
+def _fmt_grade_meta(g: dict) -> str:
+    parts = [str(g.get(k) or "").strip() for k in ("category", "column", "date", "teacher")]
+    tail = " · ".join(p for p in parts if p)
+    weight = _fmt_grade_weight(g)
+    return " · ".join(p for p in (weight, tail) if p)
+
+
+def _fmt_grade_line(g: dict, prefix: str) -> str:
+    subj = "<b>" + _esc(str(g.get("subject") or "?")) + "</b>"
+    value = "<b>" + _esc(str(g.get("value") or "?")) + "</b>"
+    meta = _fmt_grade_meta(g)
+    return f"{prefix} {subj} — {value}" + (f" · {_esc(meta)}" if meta else "")
+
+
+def format_grades_card(
+    new: list[dict],
+    edited: list[tuple[dict, dict]],
+    removed: list[dict],
+) -> str:
+    """Одна картка на цикл: нові, виправлені та видалені оцінки."""
+    if not (new or edited or removed):
+        return ""
+    if new and not (edited or removed):
+        head = "📊 <b>Нові оцінки в VULCAN</b>"
+    elif edited and not (new or removed):
+        head = "✏️ <b>Оцінки виправлено в VULCAN</b>"
+    elif removed and not (new or edited):
+        head = "🗑 <b>Оцінки видалено в VULCAN</b>"
+    else:
+        head = "📊 <b>Зміни в оцінках VULCAN</b>"
+
+    lines: list[str] = []
+    for g in sorted(new, key=lambda x: (x.get("subject_pos", 0), x.get("date", ""))):
+        lines.append(_fmt_grade_line(g, "🆕"))
+    for old, cur in sorted(
+        edited,
+        key=lambda pair: (pair[1].get("subject_pos", 0), pair[1].get("date", "")),
+    ):
+        subj = "<b>" + _esc(str(cur.get("subject") or old.get("subject") or "?")) + "</b>"
+        before = _esc(str(old.get("value") or "?"))
+        after = _esc(str(cur.get("value") or "?"))
+        meta = _fmt_grade_meta(cur)
+        line = f"✏️ {subj}: <b>{before}</b> → <b>{after}</b>"
+        if meta:
+            line += f" · {_esc(meta)}"
+        lines.append(line)
+    for g in sorted(removed, key=lambda x: (str(x.get("subject") or ""), x.get("date", ""))):
+        subj = "<b>" + _esc(str(g.get("subject") or "?")) + "</b>"
+        value = "<b>" + _esc(str(g.get("value") or "?")) + "</b>"
+        meta = _fmt_grade_meta(g)
+        line = f"🗑 {subj} — видалено {value}"
+        if meta:
+            line += f" · {_esc(meta)}"
+        lines.append(line)
+
+    # Telegram: 4096 символів на повідомлення; рідкісний «злив» після
+    # довгого простою обрізаємо, а не втрачаємо доставку.
+    max_lines = 40
+    extra = len(lines) - max_lines
+    if extra > 0:
+        lines = lines[:max_lines]
+        lines.append(f"… ще {extra} змін(и)")
+    return head + "\n" + "\n".join(lines)
+
+
+def split_telegram_message(text: str, limit: int = 3800) -> list[str]:
+    """Розбити довгу картку по рядках, не розриваючи HTML-розмітку рядка."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    cur = ""
+    for line in text.split("\n"):
+        if cur and len(cur) + 1 + len(line) > limit:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur = line if not cur else cur + "\n" + line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+# ----------------------------------------------------------------------
 # Дані з порталу (з авто-відновленням сесії через авто-логін).
 # ----------------------------------------------------------------------
 
@@ -407,7 +597,7 @@ async def _tomorrow_events_fresh(client) -> tuple[date, list[dict]]:
 
 async def _on_auth_error() -> bool:
     """Відновлення сесії при VulcanAuthError (публічний API-еквівалент
-   控制和 schedule_text): авто-логін, якщо є credentials."""
+    як у schedule_text): авто-логін, якщо є credentials."""
     return await vu.try_autologin()
 
 
@@ -515,6 +705,24 @@ async def _notify(bot, text: str) -> bool:
                             f"{type(e).__name__}: {str(e)[:80]} ({fails}/10)")
     if not sent:
         _save()
+    return sent
+
+
+async def _notify_grades(bot, text: str) -> bool:
+    """Розсилка оцінок у особистий чат (VULCAN_GRADES_CHATS/STATE_CHAT_ID)."""
+    targets = _grade_targets()
+    if not targets:
+        log.info("Vulcan grades: немає цілей — додай STATE_CHAT_ID або VULCAN_GRADES_CHATS")
+        return False
+    sent = False
+    for cid in targets:
+        for part in split_telegram_message(text):
+            try:
+                await bot.send_message(cid, part)
+                sent = True
+            except Exception as e:
+                log.warning(f"Vulcan grades: не зміг написати чат {cid}: "
+                            f"{type(e).__name__}: {str(e)[:80]}")
     return sent
 
 
@@ -692,6 +900,78 @@ async def _tomorrow_cycle(bot) -> bool:
     return True
 
 
+async def _grades_cycle(bot) -> bool:
+    """Перевірити /api/Oceny на нові/виправлені/видалені оцінки.
+
+    True = цикл завершено (успішно або немає цілей). False = варто
+    повторити наступного разу (мережа/сесія/доставка).
+    """
+    _ensure_loaded()
+    if not _grade_targets():
+        _mark_grades_poll(True, error="немає цілей (STATE_CHAT_ID/VULCAN_GRADES_CHATS)")
+        return True
+    try:
+        client = await vu.get_client()
+        try:
+            snap = await vu.grades_snapshot()
+        except vu.VulcanAuthError:
+            if not await _on_auth_error():
+                _mark_grades_poll(False, error="сесія мертва, автологін не вдався")
+                log.warning("Vulcan grades: сесія мертва, авто-логін не вдався")
+                return False
+            client = await vu.get_client()
+            snap = await vu.grades_snapshot()
+    except vu.VulcanDisabled:
+        _mark_grades_poll(False, error="VULCAN не налаштований")
+        return True
+    except vu.VulcanError as e:
+        _mark_grades_poll(False, error=f"{type(e).__name__}: {e}")
+        log.warning(f"Vulcan grades: оцінки недоступні ({type(e).__name__}: {e})")
+        return False
+
+    period = snap.get("period") or {}
+    entries = snap.get("grades") or []
+    period_id = str(period.get("id"))
+    prev_period = _state.get("grade_period")
+    seed = (prev_period != period_id) or ("grade_baseline" not in _state)
+
+    new, edited, removed, mapping = _compute_grade_changes(
+        entries, dict(_state.get("grade_signatures") or {}), seed=seed,
+    )
+    if prev_period != period_id:
+        _state["grade_period"] = period_id
+    if seed:
+        _state["grade_baseline"] = datetime.now(TZ).isoformat(timespec="seconds")
+
+    if not (new or edited or removed):
+        _state["grade_signatures"] = mapping
+        _save()
+        _mark_grades_poll(True, count=len(entries))
+        if seed:
+            log.info(f"Vulcan grades: базовий снапшот збережено "
+                     f"({len(entries)} оцінок, період {period_id})")
+        return True
+
+    card = format_grades_card(new, edited, removed)
+    if not card:
+        _state["grade_signatures"] = mapping
+        _save()
+        _mark_grades_poll(True, count=len(entries))
+        return True
+
+    if not await _notify_grades(bot, card):
+        # не фіксуємо підписи, щоб не втратити зміни (типово — немає чатів)
+        _mark_grades_poll(False, error="картку оцінок не доставлено")
+        return False
+
+    _state["grade_signatures"] = mapping
+    _save()
+    _mark_grades_poll(True, count=len(entries))
+    log.info(f"Vulcan grades: надіслано {len(new)} нових, "
+             f"{len(edited)} виправлених, {len(removed)} видалених")
+    return True
+
+
 async def notify_watcher(bot) -> None:
     """Єдина фаза: keepalive сесії + зміни + нагадування. Запускається з плагіна.
 
@@ -701,14 +981,17 @@ async def notify_watcher(bot) -> None:
     """
     import config
     poll_min = max(5, int(config.VULCAN_CHANGES_POLL_MIN or 15))
+    grades_poll_min = max(5, int(config.VULCAN_GRADES_POLL_MIN or 15))
     remind_hour = int(config.VULCAN_REMIND_HOUR or 18)
     m_hour = int(config.VULCAN_MORNING_HOUR or 6)
     m_minute = int(config.VULCAN_MORNING_MINUTE or 50)
     log.info(f"Vulcan notify запущено (зміни: кожні {poll_min}хв, "
+             f"оцінки: кожні {grades_poll_min}хв, "
              f"нагадування: {remind_hour}:00, ранок: {m_hour}:{m_minute:02d}, "
              f"тиша: 00:00–06:00)")
     await asyncio.sleep(20)  # дати боту вставати
 
+    last_grades_check = 0.0
     while True:
         now = datetime.now(TZ)
 
@@ -724,6 +1007,15 @@ async def notify_watcher(bot) -> None:
             await _changes_cycle(bot)
         except Exception as e:
             log.exception(f"Vulcan notify: помилка циклу змін: {e}")
+
+        # --- 1b. оцінки: окремий (рідший/частіший) інтервал ---
+        if (config.VULCAN_GRADES_ENABLED
+                and time.monotonic() - last_grades_check >= grades_poll_min * 60):
+            try:
+                await _grades_cycle(bot)
+            except Exception as e:
+                log.exception(f"Vulcan notify: помилка циклу оцінок: {e}")
+            last_grades_check = time.monotonic()
 
         # --- 2. ранковий дайджест (тільки вранці: після рестарту о 22:00
         #        «Доброго ранку» з розкладом уже недоречне) ---

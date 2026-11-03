@@ -391,6 +391,122 @@ def _week_of(d: date) -> tuple[date, date]:
     return start, start + timedelta(days=6)
 
 
+# ----------------------------------------------------------------------
+# Оцінки: /api/Oceny (структура перевірена на живому порталі 03.11.2026)
+# ----------------------------------------------------------------------
+
+def pick_period(periods: Any, today: date) -> dict[str, Any] | None:
+    """Обрати поточний період класифікації з /api/OkresyKlasyfikacyjne.
+
+    Повертає період, у який входить `today`, інакше — останній відомий.
+    """
+    valid: list[dict[str, Any]] = []
+    for p in periods or []:
+        if not isinstance(p, dict) or p.get("id") is None:
+            continue
+        valid.append(p)
+    if not valid:
+        return None
+    today_iso = today.isoformat()
+    for p in valid:
+        od = str(p.get("dataOd") or "")[:10]
+        do = str(p.get("dataDo") or "")[:10]
+        if od and do and od <= today_iso <= do:
+            return p
+    # dataOd у періодів відсортовані за зростанням — беремо останній
+    return valid[-1]
+
+
+def parse_grades(data: Any) -> list[dict[str, Any]]:
+    """`/api/Oceny` -> плаский список оцінок (по одному запису на оцінку).
+
+    Один «стовпчик» (`idKolumny`) може містити кілька оцінок (наприклад,
+    повторна відповідь). Тому ідентичність оцінки = предмет + idKolumny +
+    порядковий індекс у стовпчику. Саме цього достатньо, щоб відрізняти
+    нову оцінку від виправлення старої: у порталі немає окремого id оцінки.
+    """
+    if not isinstance(data, dict):
+        raise VulcanBadData("/api/Oceny — очікувався об'єкт")
+    subjects = data.get("ocenyPrzedmioty")
+    if not isinstance(subjects, list):
+        raise VulcanBadData("/api/Oceny — немає масиву 'ocenyPrzedmioty'")
+
+    out: list[dict[str, Any]] = []
+    for pos, subj in enumerate(subjects):
+        if not isinstance(subj, dict):
+            continue
+        subject = str(subj.get("przedmiotNazwa") or "").strip()
+        if not subject:
+            continue
+        teachers = subj.get("nauczyciele") or []
+        columns = subj.get("kolumnyOcenyCzastkowe") or []
+        if not isinstance(columns, list):
+            continue
+        for col in columns:
+            if not isinstance(col, dict):
+                continue
+            col_id = col.get("idKolumny")
+            grades = col.get("oceny") or []
+            if not isinstance(grades, list):
+                continue
+            for idx, g in enumerate(grades):
+                if not isinstance(g, dict):
+                    continue
+                value = str(g.get("wpis") or "").strip()
+                if not value:
+                    continue
+                raw_weight = g.get("waga")
+                try:
+                    weight = float(raw_weight) if raw_weight not in (None, "") else None
+                except (TypeError, ValueError):
+                    weight = None
+                teacher = str(g.get("nauczyciel") or "").strip()
+                if not teacher and isinstance(teachers, list) and teachers:
+                    teacher = str(teachers[0] or "").strip()
+                out.append({
+                    "subject": subject,
+                    "subject_pos": pos,
+                    "teacher": teacher,
+                    "column_id": col_id,
+                    "index": idx,
+                    "category": str(g.get("kategoriaKolumny")
+                                    or col.get("kategoriaKolumny") or "").strip(),
+                    "column": str(g.get("nazwaKolumny")
+                                  or col.get("nazwaKolumny") or "").strip(),
+                    "value": value,
+                    "date": str(g.get("dataOceny") or "").strip(),
+                    "weight": weight,
+                    "fixed_from": g.get("idOcenaPoprawiona"),
+                    "changed_since_login": bool(g.get("zmienionaOdOstatniegoLogowania")),
+                })
+    return out
+
+
+def grade_identity(g: dict[str, Any]) -> str:
+    """Стабільний ключ оцінки між опитуваннями (без значення/ваги)."""
+    return "|".join(str(x) for x in (
+        g.get("subject") or "",
+        g.get("column_id"),
+        g.get("index"),
+    ))
+
+
+def grade_signature(g: dict[str, Any]) -> str:
+    """Канонічний підпис оцінки: зміна значення/ваги/дати = виправлення."""
+    payload = {
+        "v": 1,
+        "subject": g.get("subject") or "",
+        "value": g.get("value") or "",
+        "date": g.get("date") or "",
+        "weight": g.get("weight"),
+        "teacher": g.get("teacher") or "",
+        "category": g.get("category") or "",
+        "column": g.get("column") or "",
+        "fixed_from": g.get("fixed_from"),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
 class VulcanClient:
     """Асинхронний клієнт порталу учня, авторизований через cookie."""
 
@@ -400,6 +516,7 @@ class VulcanClient:
         self._session: aiohttp.ClientSession | None = None
         self._key: str | None = None
         self._key_expires = 0.0
+        self._student: dict[str, Any] | None = None
         self._cache: dict[str, tuple[float, Any]] = {}
         self._last_auth_fail = 0.0
         self._lock = asyncio.Lock()
@@ -513,8 +630,16 @@ class VulcanClient:
         if not isinstance(key, str) or not key:
             raise VulcanBadData("/api/Context — порожній 'key' учня")
         self._key = key
+        self._student = student
         self._key_expires = time.monotonic() + _KEY_TTL
         return key, False
+
+    async def account_context(self, *, force: bool = False) -> dict[str, Any]:
+        """Кешований запис учня з /api/Context (key + idDziennik для оцінок)."""
+        await self.account_key(force=force)
+        if not self._student:
+            raise VulcanBadData("/api/Context — не вдалось запам'ятати учня")
+        return self._student
 
     async def free_days(self, key: str, ts_from: str, ts_to: str,
                         *, force: bool = False) -> tuple[list[dict], bool]:
@@ -552,6 +677,30 @@ class VulcanClient:
         )
         if not isinstance(data, list):
             raise VulcanBadData("/api/SprawdzianyZadaniaDomowe — очікувався масив")
+        return data, cached
+
+    async def periods_raw(self, key: str, id_dziennik: Any,
+                          *, force: bool = False) -> tuple[list[dict], bool]:
+        """/api/OkresyKlasyfikacyjne — періоди (семестри) для /api/Oceny."""
+        data, cached = await self._get_cached(
+            "/api/OkresyKlasyfikacyjne",
+            {"key": key, "idDziennik": str(id_dziennik)},
+            _KEY_TTL, force=force,
+        )
+        if not isinstance(data, list):
+            raise VulcanBadData("/api/OkresyKlasyfikacyjne — очікувався масив")
+        return data, cached
+
+    async def grades_raw(self, key: str, id_period: Any,
+                         *, force: bool = False) -> tuple[dict, bool]:
+        """/api/Oceny — оцінки за період класифікації."""
+        data, cached = await self._get_cached(
+            "/api/Oceny",
+            {"key": key, "idOkresKlasyfikacyjny": str(id_period)},
+            _TTL, force=force,
+        )
+        if not isinstance(data, dict):
+            raise VulcanBadData("/api/Oceny — очікувався об'єкт")
         return data, cached
 
     async def day_schedule(self, d: date, *, force: bool = False) -> tuple[list[dict], dict | None, bool]:
@@ -759,6 +908,38 @@ async def _recover_on_auth_error() -> bool:
     if _client is not None:
         _client.purge_cache()
     return await try_autologin()
+
+
+async def _fetch_grades_snapshot(client: VulcanClient) -> dict[str, Any]:
+    """Свіжі оцінки поточного періоду (один знімок для diff)."""
+    student = await client.account_context()
+    key = student.get("key")
+    if not key:
+        raise VulcanBadData("/api/Context — немає 'key' для оцінок")
+    periods, _ = await client.periods_raw(
+        key, student.get("idDziennik"), force=True,
+    )
+    period = pick_period(periods, datetime.now(TZ).date())
+    if not period:
+        raise VulcanBadData("/api/OkresyKlasyfikacyjne — немає жодного періоду")
+    data, _ = await client.grades_raw(key, period.get("id"), force=True)
+    return {"period": period, "grades": parse_grades(data)}
+
+
+async def grades_snapshot() -> dict[str, Any]:
+    """Публічний API для watcher'а оцінок.
+
+    Повертає {"period": {...}, "grades": [...]}. Сесію відновлює авто-логіном,
+    як і решта публічних функцій.
+    """
+    client = await get_client()
+    try:
+        return await _fetch_grades_snapshot(client)
+    except VulcanAuthError:
+        if not await _recover_on_auth_error():
+            raise
+        client = await get_client()
+        return await _fetch_grades_snapshot(client)
 
 
 async def schedule_text(d: date, *, force: bool = False) -> tuple[str, str]:
