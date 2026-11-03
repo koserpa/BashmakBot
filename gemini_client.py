@@ -4,6 +4,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import time
 import wave
 
@@ -184,6 +185,58 @@ def _build_system_instruction(current_date_str: str) -> str:
     )
 
 
+def _extract_retry_after(e: errors.ClientError) -> int | None:
+    """Витягує, скільки секунд чекати після 429, з будь-якого місця,
+    куди це може покласти SDK. У ClientError немає атрибута .headers
+    (саме на цьому падав обробник), тому:
+
+    1. HTTP-заголовок retry-after — якщо SDK його таки додав;
+    2. RetryInfo.retryDelay ('41s') зі details у тілі відповіді
+       (SDK кладе response_json десь у args — шукаємо dict з 'error');
+    3. 'Please retry in 41.88s' з тексту помилки (str(e) містить весь
+       JSON-рядок навіть тоді, коли dict дістати не вдалось).
+
+    Жодне з джерел не гарантоване — повертаємо None, якщо нічого немає.
+    Округлюємо вгору з запасом у 1с, щоб не вдаритись об межу знову.
+    """
+    headers = getattr(e, "headers", None)
+    if headers is not None:
+        try:
+            raw = headers.get("retry-after")
+            if raw:
+                return int(float(raw)) + 1
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+    body: object = getattr(e, "response_json", None)
+    if not isinstance(body, dict):
+        body = next(
+            (a for a in e.args if isinstance(a, dict) and "error" in a), None
+        )
+    error = body.get("error") or {} if isinstance(body, dict) else {}
+    for detail in error.get("details") or []:
+        if isinstance(detail, dict) and str(detail.get("@type", "")).endswith("RetryInfo"):
+            raw = str(detail.get("retryDelay") or "").removesuffix("s")
+            try:
+                return int(float(raw)) + 1
+            except ValueError:
+                pass
+
+    m = re.search(
+        r"""retry(?:\s+in\s+          # 'Please retry in 41.88s'
+                   |[ _]?[Dd]elay["':\s]*  # retryDelay: '41s'
+                 )([\d.]+)s""",
+        str(e),
+        re.VERBOSE,
+    )
+    if m:
+        try:
+            return int(float(m.group(1))) + 1
+        except ValueError:
+            pass
+    return None
+
+
 async def _ask_gemini_inner(contents: list, current_date_str: str) -> str:
     last_error: Exception | None = None
     system_instruction = _build_system_instruction(current_date_str)
@@ -217,14 +270,10 @@ async def _ask_gemini_inner(contents: list, current_date_str: str) -> str:
 
         except errors.ClientError as e:
             if e.code == 429:
-                # retry-after може бути нечисловим або хіба відсутнім —
-                # не словимо ValueError прямо в except-роуті. Плюс кап 90с:
-                # юзер стоїть і чекає відповідь, пов'язаний це.
-                retry_after = 120
-                try:
-                    retry_after = int((e.headers or {}).get("retry-after") or "120")
-                except (TypeError, ValueError):
-                    retry_after = 120
+                # SDK у ClientError не кладе HTTP-заголовки, тому retry-after
+                # витягуємо з тіла відповіді (RetryInfo / текст повідомлення).
+                # Кап 90с: юзер стоїть і чекає відповідь.
+                retry_after = _extract_retry_after(e) or 120
                 retry_after = max(1, min(retry_after, 90))
                 log.warning(f"Gemini 429 – waiting {retry_after}s")
                 await asyncio.sleep(retry_after)
