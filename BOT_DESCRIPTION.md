@@ -123,7 +123,7 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 - **File Size Limits**: Rejects files >20MB to prevent overload
 
 ### Commands
-- User: `/start`, `/help`, `/rozklad [day]`, `/sprawdziany`, `/oceny`, `/remind <time> <text>`, `/reminders`, `/remind_del <id>`, `/gadalka`, `/swap` (toggle between the default persona and "Гога" — a drunk Georgian who speaks broken Russian; persisted via the state snapshot)
+- User: `/start`, `/help`, `/rozklad [day]`, `/sprawdziany`, `/oceny`, `/remind <time> <text>`, `/reminders`, `/remind_del <id>`, `/gadalka`, `/swap [name]` (toggle through personas or pick directly: default "Башмак", "Гога" — drunk Georgian, "Роза" — flirty flower-seller; persisted via the state snapshot)
 - Admin: `/reset` (clear chat memory), `/profile` (edit user profiles: list / set / delete), `/status` (bot stats), `/model` (AI usage), `/features` (flag status)
 
 ### Configuration & Deployment

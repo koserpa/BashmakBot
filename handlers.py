@@ -598,7 +598,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             "/oceny — всі оцінки за семестр + зважений середній бал («шо по оцінках» теж працює)\n"
             "/rozklad_status — стан сесії VULCAN\n"
             "/vulcan_silence — вкл/викл проактивні сповіщення для чату\n"
-            "/swap — переключити мене між звичайним режимом і Гогою 🇬🇪\n"
+            "/swap — моя персона: /swap (по колу) або /swap goga|roza|default\n"
             "🔔 Автоматично: заміни/відміни в розкладі кидаю в чат сам, "
             "вечором наперед попереджаю про sprawdzian/kartkówka/дз, ранком кажу розклад на сьогодні\n"
             "/remind 15m текст — поставити нагадування через 15 хв (є і 1h30m, і 18:00)\n"
@@ -625,18 +625,23 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
 
     @dp.message(Command("swap"))
     async def cmd_swap(message: Message):
-        """/swap — переключити персону бота (режим зберігається в снапшоті,
-        переживає редеплой). Відкрита всім: чат друзів, іграшка спільна."""
-        new_mode = persona.toggle()
-        if new_mode == "goga":
-            await message.answer(
-                "🇬🇪🥴 Здарова, мегобари! Гога вступає на зміну. "
-                "Вайме, яке гарне чао, ара, не спecsіть...")
+        """/swap — персони бота. Без аргументу — наступна по колу,
+        «/swap <ім'я>» — пряме включення (напр. /swap goga, /swap roza).
+        Режим зберігається в снапшоті, переживає редеплой. Відкрита всім:
+        чат друзів, іграшка спільна."""
+        args = (message.text or "").split(maxsplit=1)
+        if len(args) > 1:
+            target = args[1].strip().lower().lstrip("@")
+            if not persona.set_mode(target):
+                known = "\n".join(
+                    f"• /swap {m} — {persona.mode_name(m)}" for m in persona.MODES
+                )
+                await message.answer(f"🤨 Такої персони нема. Є:\n{known}")
+                return
         else:
-            await message.answer(
-                "✅ Все, протверезів — знову звичайний Башмак. "
-                "Гога пішов допивати мандарини.")
-        log.info(f"/swap: персона -> {new_mode}")
+            persona.toggle()
+        await message.answer(f"🎭 {persona.mode_name()}\n{persona.current_hello()}")
+        log.info(f"/swap: персона -> {persona.mode()}")
 
     @dp.message(Command("profile"), IsAdmin())
     async def cmd_profile(message: Message):
@@ -707,7 +712,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         else:
             alive = "—"
         lines.append(f"🫀 Фонові циклі: {alive}")
-        persona_name = "Гога 🇬🇪" if persona.mode() == "goga" else "Башмак"
+        persona_name = persona.mode_name()
         lines.append(f"🎭 Персона: {persona_name}")
 
         await message.answer("\n".join(lines))
