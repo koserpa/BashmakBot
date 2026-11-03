@@ -86,7 +86,7 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 
 ### Persistent State (`state_store.py`)
 - On Koyeb Free the container disk is ephemeral, so `data/*.json` is only a cache and disappears on redeploy/cold start.
-- The bot keeps a single `bashmak-state.json` pinned in its private chat with the owner (`STATE_CHAT_ID`): VULCAN baseline + lesson signatures + notified event ids, and the reminder list.
+- The bot keeps a single `bashmak-state.json` pinned in its private chat with the owner (`STATE_CHAT_ID`): VULCAN baseline + lesson signatures + grade signatures + notified event ids, and the reminder list.
 - On start it reads `getChat(STATE_CHAT_ID).pinned_message.document` → `getFile` → `download_file` and applies known sections; modules register sections via `state_store.register(name, getter, setter)`.
 - Updates use `editMessageMedia` on the same message (no new messages, no notifications, throttled); if the pinned message was deleted/unpinned, a new document is sent and pinned.
 - Network/broken-JSON errors never overwrite a good snapshot; the background loop retries. Without `STATE_CHAT_ID` the store is a no-op.
@@ -120,6 +120,7 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 5. **Date Synchronization** - Periodically updates current date from internet source
 6. **Health Server** - Minimal HTTP endpoint for platforms requiring web service (Koyeb)
 7. **VULCAN Schedule Notifications** - Every 15 min polls the student's VULCAN portal and posts schedule changes to the chat: cancellations, teacher/room substitutions, moved lessons, group changes and class outings. Detects changes by diffing lesson signatures against a snapshot; on a fresh deploy it still reports current changes instead of silently seeding a baseline, while the baseline and notified ids are restored from the pinned Telegram snapshot so redeploys don't resend cards. Also sends a morning digest and day-before exam/homework reminders (`vulcan_notify.py`). Change cards list the teacher (and room) next to each lesson, show only the new value in the change line (no duplicated old value or lesson name), and group all of a lesson's changes into one bullet.
+8. **VULCAN Grade Notifications** - Every 15 min polls `/api/Oceny` for the current term and diffs each grade's signature (subject + column id + index, including value/weight/date/teacher). New, corrected (e.g. `5` → `6-`) and deleted grades are sent to the owner's DM (`STATE_CHAT_ID`, override with `VULCAN_GRADES_CHATS`); cards show the grade, its weight (`waga`), category/column, date and teacher. The first run and term changes seed the baseline silently, and undelivered changes are retried (`vulcan_notify.py`).
 
 ### Media Handling
 - **Photos**: Downloads, sends to Gemini Vision for description/analysis

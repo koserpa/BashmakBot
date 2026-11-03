@@ -106,7 +106,9 @@ Koyeb Free: диск ефемерний → `data/*.json` не пережива�
 
 - `bashmak-state.json` = `{v, saved_at, sections: {ім'я: дані}}`;
 - модулі реєструють свої секції: `state_store.register("vulcan_notify", getter, setter)`
-  (зараз `vulcan_notify` і `reminders`); невідомі секції при відновленні ігноруються;
+  (зараз `vulcan_notify`, `reminders`, `chat_history`); невідомі секції при
+  відновленні ігноруються; підписи оцінок (`grade_signatures`, `grade_period`,
+  `grade_baseline`) живуть усередині секції `vulcan_notify`;
 - старт: `getChat(STATE_CHAT_ID).pinned_message.document` → `getFile` → `download_file`
   → `_apply`. Якщо піна немає — створюємо документ і пінимо; якщо читання впало
   (мережа, битий JSON) — **не перезаписуємо** добрий стан, фоновий цикл повторює;
@@ -230,6 +232,18 @@ keepalive_watcher не стартує, коли notify увімкнено (`VULC
    Ids сповіщених зберігаються з ДАТОЮ сповіщення
    та чистяться при _save() (TTL 35 днів, `NOTIFIED_TTL_DAYS`) —
    рестарти не спам знову, state не розростається.
+3b. **Оцінки (03.11.2026)**: кожні `VULCAN_GRADES_POLL_MIN` хв (default 15)
+   тягнемо `OkresyKlasyfikacyjne` → поточний семестр → `Oceny` **force=True**.
+   Порівнюємо підписи кожної оцінки: у порталі немає id оцінки, тому
+   identity = `предмет + idKolumny + індекс у стовпчику`, а підпис включає
+   `wpis/data/вагу/вчителя/категорію/назву стовпчика`. Так ловимо і **нові**,
+   і **виправлені старі** оцінки (вчитель змінив `5`→`6-` — це edited), і
+   видалені. Картка показує вагу (`вага 2`), категорію/назву стовпчика, дату
+   й учителя. Перший запуск/зміна семестру — тихий seed (щоб не вивалити всі
+   35 старих оцінок), далі — тільки зміни. Куди слати: `VULCAN_GRADES_CHATS`,
+   порожньо = `STATE_CHAT_ID` (особистий чат; у групи оцінки не йдуть).
+   `VULCAN_GRADES_ENABLED=false` вимикає фічу.
+
 4. **`/sprawdziany`** (публічний API `upcoming_events_text(days=30)`) —
    всі події на 30 днів, групування по датах. Текстові тригери БЕЗ слеша
    (регес `plugins/vulcan.py`: «башмак, розклад на завтра», «шо по дз»,
@@ -253,6 +267,13 @@ GET /api/DniWolne?key&dataOd&dataDo                -> свята
 GET /api/SprawdzianyZadaniaDomowe?key&dataOd&dataDo -> sprawdziany + дз!
      (item: {typ: 1..4, przedmiotNazwa, data, hasAttachment, id};
       typ→назва див. словарь вище)
+GET /api/OkresyKlasyfikacyjne?key&idDziennik -> [{id, numerOkresu, dataOd, dataDo}]
+GET /api/Oceny?key&idOkresKlasyfikacyjny -> {ocenyPrzedmioty: [
+       {przedmiotNazwa, nauczyciele, kolumnyOcenyCzastkowe: [
+         {idKolumny, kategoriaKolumny, nazwaKolumny, oceny: [
+           {wpis, dataOceny, waga, nauczyciel, idOcenaPoprawiona, ...}]}]}],
+       ustawienia}
+     (03.11.2026: вага у КОЖНОЇ оцінки; окремого id оцінки немає)
 GET /api/*Tablica (SprawdzianyTablica, ZadaniaDomoweTablica, WazneDzisiaj...) -> тільки "сьогодні"
 ```
 Всі ендпоінти GET+query, утилізуються з кукі сесії; невідомий шлях сервер віддає
@@ -282,6 +303,9 @@ GET /api/*Tablica (SprawdzianyTablica, ZadaniaDomoweTablica, WazneDzisiaj...) ->
 | `VULCAN_UA` | UA для API-запитів |
 | `VULCAN_NOTIFY_CHATS` | chat_id (через кому) для проактивних сповіщень; порожньо = чати, де юзали /rozklad |
 | `VULCAN_CHANGES_POLL_MIN` | період перевірки замін у розкладі (15); ніч 00:00–06:00 — пауза |
+| `VULCAN_GRADES_ENABLED` | `false` — вимкнути сповіщення про оцінки |
+| `VULCAN_GRADES_CHATS` | chat_id (через кому) для оцінок; порожньо = `STATE_CHAT_ID` (особистий чат) |
+| `VULCAN_GRADES_POLL_MIN` | період перевірки оцінок (15); ніч 00:00–06:00 — пауза |
 | `VULCAN_REMIND_HOUR` | година (Варшава) нагадування про завтрашні sprawdzian/дз (18) |
 | `VULCAN_MORNING_HOUR[_MINUTE]` | ранковий дайджест «розклад на сьогодні» (6:50) |
 | `VULCAN_NOTIFY` | `false` — вимкнути всі проактивні сповіщення (штатний keepalive повертається) |
