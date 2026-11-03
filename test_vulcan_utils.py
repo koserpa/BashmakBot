@@ -104,11 +104,15 @@ def test_lesson_with_change() -> None:
     raw["zmiany"] = [{"zmiana": 7, "prowadzacy": "Wakat WAKAT", "sala": "101"}]
     raw["zmianyUwagi"] = ["Lekcja przeniesiona"]
     l = lesson_from_raw(raw)
-    # «було → стало»: старий вчитель/кабінет з самого уроку
-    assert "🔄 Заміна вчителя → Wakat WAKAT" in l["changes"]
-    assert "🔄 Заміна кабінету → 101" in l["changes"]
+    # zmiany = хто БУВ у базовому плані (навіть вакансія), топ-рівень = хто
+    # веде тепер: «Заміна: Wakat → Примеровий» = вакансію закрив Автор
+    assert "🔄 Заміна вчителя: Wakat WAKAT → Примеровий Автор" in l["changes"]
+    assert "🔄 Заміна кабінету: 101 → 204" in l["changes"]
     assert "ℹ️ Lekcja przeniesiona" in l["changes"]
     assert l["canceled"] is False
+    # структурні поля: «як було» в базовому плані
+    assert l["teacher_was"] == "Wakat WAKAT"
+    assert l["room_was"] == "101"
 
 
 def test_lesson_canceled_notice() -> None:
@@ -190,7 +194,10 @@ def test_lesson_same_group_lesson_note() -> None:
 def test_lesson_room_change_code8() -> None:
     raw = dict(RAW_PLAIN)
     raw["zmiany"] = [{"zmiana": 8, "sala": "101"}]
-    assert "🔄 Заміна кабінету → 101" in lesson_from_raw(raw)["changes"]
+    l = lesson_from_raw(raw)
+    assert "🔄 Заміна кабінету: 101 → 204" in l["changes"]
+    assert l["room_was"] == "101"
+    assert l["teacher_was"] == ""
 
 
 def test_lesson_unknown_change_code_not_lost() -> None:
@@ -198,7 +205,8 @@ def test_lesson_unknown_change_code_not_lost() -> None:
     raw["zmiany"] = [{"zmiana": 99, "sala": "7"}]
     l = lesson_from_raw(raw)
     assert l["canceled"] is False
-    assert "🔄 Заміна кабінету → 7" in l["changes"]
+    assert "🔄 Заміна кабінету: 7 → 204" in l["changes"]
+    assert l["room_was"] == "7"
 
 
 def test_format_lesson_line_canceled_strikethrough() -> None:
@@ -222,6 +230,31 @@ def test_format_lesson_line_escapes_html() -> None:
     assert "Matematyka &amp; Fizyka &lt;b&gt;" in line
     assert "Kowalski &amp; Syn" in line
     assert line.count("<b>") == 1 and line.count("</b>") == 1
+
+
+def test_format_lesson_line_shows_actual_teacher() -> None:
+    """Топ-рівень уроку — хто веде тепер; той, хто був у плані (навіть
+    вакансія), згадується лише в рядку зміни як «як було → хто веде»."""
+    raw = dict(RAW_PLAIN)
+    raw["zmiany"] = [{"zmiana": 7, "prowadzacy": "Wakat5 WAKAT POLSKI TC"}]
+    line = format_lesson_line(1, lesson_from_raw(raw))
+    # у рядку уроку — актуальний вчитель (з топ-рівня)
+    assert "— Примеровий Автор" in line
+    # повна пара «як було → хто веде» — в рядку зміни
+    assert "Wakat5 WAKAT POLSKI TC → Примеровий Автор" in line
+    # актуальний вчитель стоїть у рядку уроку (першим), «як було» — в зміні
+    assert line.index("Примеровий Автор") < line.index("Wakat5")
+
+
+def test_format_lesson_line_substituted_room() -> None:
+    """Заміна кабінету: рядок уроку показує актуальний кабінет (топ-рівень),
+    зміна — «як було → стало»."""
+    raw = dict(RAW_PLAIN)
+    raw["zmiany"] = [{"zmiana": 8, "sala": "101"}]
+    line = format_lesson_line(1, lesson_from_raw(raw))
+    assert "[каб. 204]" in line
+    assert "[каб. 101]" not in line
+    assert "101 → 204" in line
 
 
 def test_lesson_missing_day_raises() -> None:

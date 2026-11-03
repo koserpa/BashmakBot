@@ -25,16 +25,8 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
    - Loads environment variables via python-dotenv
    - Defines bot tokens, API keys, model names
    - Contains `ENABLED_PLUGINS` — list of plugin names to load on startup
-   - Contains `USER_CONTEXT` - personalized profiles for known users (style + sensitive notes)
-   - Holds `SYSTEM_PROMPT` - core behavioral instructions for the AI
-   - Manages feature flags (via features.py)
-
-3. **bot_state.py** - Runtime State Management
-
-2. **config.py** - Configuration & Constants
-   - Loads environment variables via python-dotenv
-   - Defines bot tokens, API keys, model names
-   - Contains `USER_CONTEXT` - personalized profiles for known users (style + sensitive notes)
+   - Contains `USER_CONTEXT` - static user profiles (style only; sensitive field removed by owner's decision 03.11.2026)
+   - Contains `USER_MEMORY_*` knobs (daily fact extraction from chat)
    - Holds `SYSTEM_PROMPT` - core behavioral instructions for the AI
    - Manages feature flags (via features.py)
 
@@ -78,7 +70,7 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
    - `absence_utils.py` - Tracks user silence periods for absence pokes
    - `drama_utils.py` - Detects heated conversations ("drama") for intervention
    - `reminder_utils.py` - Manages chat-based reminder system
-   - `timetable_utils.py` - Provides school schedule information (2TC)
+   - `vulcan_utils.py` - VULCAN student portal client + schedule/grades formatting (autologin chain in `vulcan_autologin.py`, proactive notifications in `vulcan_notify.py`)
    - `poland_utils.py` - Polish calendar/context information
    - `media_utils.py` - Handles media downloading, extraction, and preparation
    - `text_utils.py` - Text processing helpers (mention extraction, trigger stripping)
@@ -92,6 +84,7 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 - Network/broken-JSON errors never overwrite a good snapshot; the background loop retries. Without `STATE_CHAT_ID` the store is a no-op.
 - The snapshot contains no tokens/passwords/cookies; its status is exposed in `/health` under `state`.
 - Chat history (`bot_state.py`) is also persisted via `state_store`: per chat `{summary, recent}`; when `recent` exceeds `HISTORY_SUMMARY_THRESHOLD` (40 messages), older messages are compressed into `summary` by Gemini. Config: `HISTORY_PERSIST_ENABLED`, `HISTORY_SUMMARY_THRESHOLD`, `HISTORY_RECENT_KEEP`, `HISTORY_SAVE_MIN_SEC`.
+- User profiles (`user_profiles.py`) and user memory (`user_memory.py`) are snapshot sections too: dynamic `/profile` overrides static `USER_CONTEXT`, and daily LLM-extracted facts (plans, events, hobbies — public-safe only) are stored per user with dates, capped at `USER_MEMORY_MAX_FACTS` with a 60-day TTL.
 
 ## Key Features & Behaviors
 
@@ -106,7 +99,7 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
   - Secret rule: special handling for messages ending with "пж" (do literally)
 
 ### Context Awareness
-- **Sender Context**: Personalized style notes from `USER_CONTEXT` (with sensitive flags)
+- **Sender Context**: user profile (`USER_CONTEXT` static or `/profile` dynamic) + auto-extracted facts from chat with dates (`user_memory.py`)
 - **Mentioned Users**: Extracts @username references and adds their public profiles
 - **Chat History**: Maintains rolling conversation history (configurable size)
 - **Web Search**: Augments responses with current info when needed (via Tavily)
@@ -130,8 +123,8 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 - **File Size Limits**: Rejects files >20MB to prevent overload
 
 ### Commands
-- User: `/start`, `/help`, `/rozklad [day]`, `/remind <time> <text>`, `/reminders`, `/remind_del <id>`, `/gadalka`
-- Admin: `/reset` (clear chat memory), `/status` (bot stats), `/model` (AI usage), `/features` (flag status)
+- User: `/start`, `/help`, `/rozklad [day]`, `/sprawdziany`, `/oceny`, `/remind <time> <text>`, `/reminders`, `/remind_del <id>`, `/gadalka`, `/swap` (toggle between the default persona and "Гога" — a drunk Georgian who speaks broken Russian; persisted via the state snapshot)
+- Admin: `/reset` (clear chat memory), `/profile` (edit user profiles: list / set / delete), `/status` (bot stats), `/model` (AI usage), `/features` (flag status)
 
 ### Configuration & Deployment
 - Requires `.env` with: `BOT_TOKEN`, `GEMINI_API_KEY`, `GEMINI_MODEL`, `STATE_CHAT_ID` (private chat id for the pinned state snapshot), optional `TAVILY_API_KEY`, `ADMIN_USERNAME`, etc.
@@ -141,9 +134,17 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 - Fallback model support via `GEMINI_FALLBACK_MODEL`
 
 ## Data Flow Example
-1. User sends message: "@BashmakBot погода в Би"
+1. User sends message: "@Bashma4ek_Bot погода в Бытом"
+2. `handlers.py` dispatches text → gathers chat history + sender context (`bot_state`, `USER_CONTEXT`)
+3. `search_utils.py` classifies the query → fetches weather from Open-Meteo
+4. `gemini_client.py` generates a short answer with the fetched data → bot replies (optionally with voice)
+
 ## Плагины / Команды (добавлено)
 - Plugin system: плагины в `plugins/` автономно загружаются через `load_plugins()`.
+- `/rozklad [день]`, `/rozklad тиждень` — реальний розклад з VULCAN; текстом теж («башмак, розклад на завтра»).
+- `/sprawdziany` — sprawdziany/картківки/дз на 30 днів («шо по дз» теж працює).
+- `/oceny` — всі оцінки за поточний семестр + зважений середній бал («шо по оцінках» теж працює).
+- `/vulcan_silence` — увімкнути/вимкнути проактивні сповіщення VULCAN у чаті.
 - `/fill <текст>` — ставит напоминание через `reminder_utils` (реально отправляет в чат через `reminders_watcher`).
 - `/joke` — случайная шутка (`plugins/funny.py`).
 - `/hello` — привет (`plugins/hello.py`).

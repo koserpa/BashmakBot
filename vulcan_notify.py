@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from datetime import date, datetime, timedelta
 from html import escape as _esc
@@ -339,15 +340,17 @@ def format_changes_card(day_name: str, ddmm: str, items: list[dict]) -> str:
     for l in sorted(items, key=lambda x: (x["start"], x["end"])):
         t = f"{l['start']}" if l.get("start") else "--:--"
         subj = "<b>" + _esc(l.get("subject") or "?") + "</b>"
-        # вчитель (і кабінет) — щоб картка була самодостатньою: у самій
-        # зміні ми вже не повторюємо старе значення, воно стоїть тут
-        who = (l.get("teacher") or "").strip()
-        room = (l.get("room") or "").strip()
-        extra = ", ".join(x for x in (
-            who, f"каб. {room}" if room else "",
-        ) if x)
-        if extra:
-            subj += f" ({_esc(extra)})"
+        # вчитель/кабінет з уроку — актуальні дані. При заміні НЕ показуємо
+        # в дужках: рядок зміни вже несе повну пару «як було → хто веде»,
+        # дублювати актуальне значення — шум
+        if not (l.get("teacher_was") or l.get("room_was")):
+            who = (l.get("teacher") or "").strip()
+            room = (l.get("room") or "").strip()
+            extra = ", ".join(x for x in (
+                who, f"каб. {room}" if room else "",
+            ) if x)
+            if extra:
+                subj += f" ({_esc(extra)})"
         # одна картка = один рядок на урок: назву не повторюємо, навіть якщо
         # змін кілька (вони йдуть через «;» в тому ж рядку)
         notes = [_esc(c) for c in (l.get("changes") or [])]
@@ -540,6 +543,132 @@ def format_grades_card(
         lines = lines[:max_lines]
         lines.append(f"… ще {extra} змін(и)")
     return head + "\n" + "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# /oceny: огляд оцінок за семестр + зважений середній (тестується офлайн)
+# ----------------------------------------------------------------------
+
+# «5-» -> 4.75, «4+» -> 4.25 (VULCAN традиційно змінює +/- на 0.25).
+# Не-числові записи (bz, np, «+», «-») в середній не йдуть, але показуються.
+_GRADE_VALUE_RE = re.compile(r"^([1-6])([+-]{0,2})$")
+GRADE_STEP = 0.25
+
+
+def grade_numeric(value: Any) -> float | None:
+    """Числове значення оцінки з модифікатором, або None для нечислових."""
+    m = _GRADE_VALUE_RE.match(str(value or "").strip())
+    if not m:
+        return None
+    num = float(m.group(1))
+    mods = m.group(2)
+    if mods:
+        num += GRADE_STEP * len(mods) * (1 if mods[0] == "+" else -1)
+        num = min(6.0, max(1.0, num))
+    return num
+
+
+def weighted_average(grades: list[dict]) -> float | None:
+    """Зважений середній по оцінках із числовим значенням і вагою > 0."""
+    total = 0.0
+    weights = 0.0
+    for g in grades:
+        v = grade_numeric(g.get("value"))
+        w = g.get("weight")
+        if v is None or not isinstance(w, (int, float)) or w <= 0:
+            continue
+        total += v * w
+        weights += w
+    return total / weights if weights else None
+
+
+def _fmt_date_short(d: str) -> str:
+    """Дата з API -> 'DD.MM'. /api/Oceny дає '26.02.2026' (DD.MM.YYYY),
+    періоди — ISO '2026-02-26'; вміємо обидва."""
+    d = str(d or "").strip()
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})", d)
+    if m:
+        return f"{m.group(1).zfill(2)}.{m.group(2).zfill(2)}"
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", d)
+    if m:
+        return f"{m.group(3)}.{m.group(2)}"
+    return ""
+
+
+def _fmt_overview_line(g: dict) -> str:
+    value = "<b>" + _esc(str(g.get("value") or "?")) + "</b>"
+    parts: list[str] = []
+    weight = _fmt_grade_weight(g)
+    if weight:
+        parts.append(weight)
+    # категорія/назва стовпчика дублюють одне одного — показуємо одне
+    label = str(g.get("category") or g.get("column") or "").strip()
+    if label:
+        parts.append(label)
+    short = _fmt_date_short(g.get("date"))
+    if short:
+        parts.append(short)
+    return "• " + value + (" · " + " · ".join(_esc(p) for p in parts) if parts else "")
+
+
+def format_grades_overview(grades: list[dict], period: dict | None) -> str:
+    """Всі оцінки за семестр, згруповані по предметах, зі зваженим середнім."""
+    if not grades:
+        return ""
+    by_subject: dict[tuple[int, str], list[dict]] = {}
+    for g in grades:
+        pos = g.get("subject_pos")
+        key = (pos if isinstance(pos, int) else 0, str(g.get("subject") or "?"))
+        by_subject.setdefault(key, []).append(g)
+
+    head = "📊 <b>Оцінки</b>"
+    if period:
+        num = period.get("numerOkresu")
+        od = _fmt_date_short(period.get("dataOd"))
+        do = _fmt_date_short(period.get("dataDo"))
+        tail = []
+        if num:
+            tail.append(f"Semestr {num}")
+        if od and do:
+            tail.append(f"{od} – {do}")
+        if tail:
+            head += " — " + " · ".join(tail)
+    head += " (<b>Dziennik VULCAN</b>)"
+
+    blocks: list[str] = []
+    overall: list[dict] = []
+    for (_pos, subject), items in sorted(by_subject.items()):
+        avg = weighted_average(items)
+        head_line = "<b>" + _esc(subject) + "</b>"
+        if avg is not None:
+            head_line += f" — {avg:.2f}"
+        lines = [_fmt_overview_line(g) for g in items]
+        blocks.append(head_line + "\n" + "\n".join(lines))
+        overall.extend(items)
+
+    total = weighted_average(overall)
+    if total is not None:
+        blocks.append(f"📈 <b>Зважений середній: {total:.2f}</b>")
+    return head + "\n\n" + "\n\n".join(blocks)
+
+
+async def grades_overview_text() -> tuple[str, str]:
+    """Публічний API для хендлера /oceny: всі оцінки за поточний семестр.
+
+    Повертає (status, html) — той самий контракт, що schedule_text.
+    Сесію відновлює grades_snapshot (авто-логін усередині).
+    """
+    try:
+        snap = await vu.grades_snapshot()
+    except vu.VulcanDisabled:
+        raise
+    except (vu.VulcanAuthError, vu.VulcanUnavailable, vu.VulcanBadData) as e:
+        return "error", vu._error_text(e)
+
+    body = format_grades_overview(snap.get("grades") or [], snap.get("period"))
+    if not body:
+        return "ok", "📊 <b>Оцінок за цей семестр ще немає</b> (Dziennik VULCAN)."
+    return "ok", body
 
 
 def split_telegram_message(text: str, limit: int = 3800) -> list[str]:

@@ -23,10 +23,13 @@ from google.genai import types
 import absence_utils
 import bot_state
 import drama_utils
+import persona
 import reminder_utils
+import user_memory
+import user_profiles
 from config import (
     ADMIN_USERNAME, GEMINI_MODEL, GEMINI_RPD_LIMIT, TTS_RPD_LIMIT,
-    TRIGGER_NAMES, USER_CONTEXT,
+    TRIGGER_NAMES,
 )
 from features import (
     REACT_UNPROMPTED_CHANCE,
@@ -132,36 +135,29 @@ def was_mentioned(message: Message) -> bool:
 
 
 def get_sender_context(message: Message) -> str:
-    """Контекст про співрозмовника для його ВЛАСНОЇ відповіді. «Чутливе»
-    додається з позначкою «не піднімай», тож модель зачепить його лише
-    якщо людина сама заговорить про це."""
-    if not message.from_user or not message.from_user.username:
+    """Контекст про співрозмовника для його ВЛАСНОЇ відповіді:
+    профіль (статичний або /profile) + авто-пам'ять з чату (user_memory)."""
+    if not message.from_user:
         return ""
-    username = message.from_user.username.lstrip("@").lower()
-    for known_username, ctx in USER_CONTEXT.items():
-        if known_username.lower() == username:
-            if isinstance(ctx, dict):
-                text = ctx.get("style", "")
-                if ctx.get("sensitive"):
-                    text += (
-                        f"\n[Чутливе, НЕ піднімай як тему; використовуй лише "
-                        f"якщо людина сама зачепить це: {ctx['sensitive']}]"
-                    )
-                return text
-            return ctx  # backward-compat for plain-string entries
-    return ""
+    username = (message.from_user.username or "").lstrip("@").lower()
+    full_name = message.from_user.full_name or ""
+    parts = [p for p in (
+        user_profiles.get_style(username),
+        user_memory.get_memory_text(username, full_name),
+    ) if p]
+    return "\n".join(parts)
 
 
 def get_public_context_by_username(username: str) -> str:
-    """ПУБЛІЧНИЙ профіль людини (лише style, без поля sensitive). Використовується
+    """ПУБЛІЧНИЙ профіль людини (профіль + авто-пам'ять). Використовується
     скрізь, де бот пише в загальний чат щось про людину: /gadalka,
-    absence-підкол, згадки через @. Чутливе в загальний чат не потрапляє."""
-    for known_username, ctx in USER_CONTEXT.items():
-        if known_username.lower() == (username or "").lower():
-            if isinstance(ctx, dict):
-                return ctx.get("style", "")
-            return ctx
-    return ""
+    absence-підкол, згадки через @. Авто-факти публічно-безпечні за
+    побудовою (витягування забороняє приватне), тому тут їх можна."""
+    parts = [p for p in (
+        user_profiles.get_style(username),
+        user_memory.get_memory_text(username),
+    ) if p]
+    return "\n".join(parts)
 
 
 def get_public_context(message: Message) -> str:
@@ -172,7 +168,7 @@ def get_public_context(message: Message) -> str:
 
 def get_mentioned_users_context(text: str) -> str:
     """Шукає в тексті @згадки відомих учасників (окрім самого бота) і
-    повертає для них ПУБЛІЧНИЙ контекст (лише style) із USER_CONTEXT."""
+    повертає для них ПУБЛІЧНИЙ контекст (профіль + пам'ять)."""
     if not text:
         return ""
 
@@ -183,12 +179,9 @@ def get_mentioned_users_context(text: str) -> str:
     for username in mentioned_usernames:
         if username.lower() == bot_username_lower:
             continue
-        for known_username in USER_CONTEXT:
-            if known_username.lower() == username.lower():
-                style = get_public_context_by_username(known_username)
-                if style:
-                    blocks.append(f"@{known_username}: {style}")
-                break
+        style = get_public_context_by_username(username)
+        if style:
+            blocks.append(f"@{username}: {style}")
 
     if not blocks:
         return ""
@@ -334,7 +327,7 @@ async def maybe_poke_absent_user(bot: Bot, message: Message) -> None:
     absence_utils.mark_poked(chat_id, user_id)  # одразу, щоб не задвоїти
 
     days = silence_hours / 24
-    style = get_public_context_by_username(username)  # без sensitive
+    style = get_public_context_by_username(username)  # публічний контекст
     prompt = (
         f"[СИСТЕМНЕ]: {full_name} не писав(-ла) в чаті вже приблизно {days:.1f} дні, "
         f"а хтось щойно написав. Напиши ОДНЕ коротке необразливе речення, яке "
@@ -579,6 +572,10 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             full_name = message.from_user.full_name if message.from_user else ""
             text = message.text or message.caption or ""
 
+            # username <-> Telegram-ім'я: для авто-пам'яті (user_memory),
+            # щоб витягнуті з чату факти мапились на профіль
+            user_memory.note_user(username, full_name)
+
             drama_utils.record_message(message.chat.id, user_id, text)
             absence_utils.record_activity(message.chat.id, user_id, username, full_name)
 
@@ -598,8 +595,10 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             "/rozklad тиждень — тижневий огляд (пн-нд)\n"
             "«башмак, розклад ...» текстом теж працює (тільки зі зверненням до бота)\n"
             "/sprawdziany — всі sprawdziany/картківки/дз на 30 днів («Бот шо по дз» теж працює)\n"
+            "/oceny — всі оцінки за семестр + зважений середній бал («шо по оцінках» теж працює)\n"
             "/rozklad_status — стан сесії VULCAN\n"
             "/vulcan_silence — вкл/викл проактивні сповіщення для чату\n"
+            "/swap — переключити мене між звичайним режимом і Гогою 🇬🇪\n"
             "🔔 Автоматично: заміни/відміни в розкладі кидаю в чат сам, "
             "вечором наперед попереджаю про sprawdzian/kartkówka/дз, ранком кажу розклад на сьогодні\n"
             "/remind 15m текст — поставити нагадування через 15 хв (є і 1h30m, і 18:00)\n"
@@ -612,6 +611,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             text += (
                 "\n\nТільки для адміна:\n"
                 "/reset — очистити пам'ять поточного чату\n"
+                "/profile — профілі: /profile (список), /profile @user текст (задати), /profile @user del (видалити)\n"
                 "/status — статус бота (uptime, квоти Gemini/TTS, живі фонові циклі)\n"
                 "/model — інфо про модель та ліміти запитів\n"
                 "/features — які фіча-флаги зараз увімкнено"
@@ -622,6 +622,65 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
     async def cmd_reset(message: Message):
         bot_state.clear_history(message.chat.id)
         await message.answer("Пам'ять цього чату очищена 🧹")
+
+    @dp.message(Command("swap"))
+    async def cmd_swap(message: Message):
+        """/swap — переключити персону бота (режим зберігається в снапшоті,
+        переживає редеплой). Відкрита всім: чат друзів, іграшка спільна."""
+        new_mode = persona.toggle()
+        if new_mode == "goga":
+            await message.answer(
+                "🇬🇪🥴 Здарова, мегобари! Гога вступає на зміну. "
+                "Вайме, яке гарне чао, ара, не спecsіть...")
+        else:
+            await message.answer(
+                "✅ Все, протверезів — знову звичайний Башмак. "
+                "Гога пішов допивати мандарини.")
+        log.info(f"/swap: персона -> {new_mode}")
+
+    @dp.message(Command("profile"), IsAdmin())
+    async def cmd_profile(message: Message):
+        """/profile — профілі користувачів: подивитись / задати / видалити.
+
+        Динамічний профіль зберігається у снапшоті (user_profiles) і
+        перекриває статичний з config.USER_CONTEXT."""
+        parts = (message.text or "").split(maxsplit=2)
+        if len(parts) == 1:
+            # список усіх профілів
+            lines = []
+            for u in user_profiles.known_usernames():
+                style = user_profiles.get_style(u)
+                src = user_profiles.source(u)
+                facts = user_profiles.facts_count(u)
+                tail = f", пам'ять: {facts}" if facts else ""
+                preview = (style[:110] + "…") if len(style) > 110 else style
+                lines.append(f"• @{u} ({src}{tail}): {preview or '—'}")
+            await message.answer(
+                "\n".join(lines) if lines else "Профілів немає.")
+            return
+        target = parts[1].lstrip("@").lower()
+        if len(parts) == 2:
+            style = user_profiles.get_style(target)
+            memory = user_memory.get_memory_text(target)
+            text = f"@{target}:\n{style or '(порожньо)'}"
+            if memory:
+                text += "\n\n" + memory
+            await message.answer(text)
+            return
+        payload = parts[2].strip()
+        if payload.lower() in ("del", "delete", "видалити"):
+            ok = user_profiles.delete_profile(target)
+            await message.answer(
+                f"🗑 Профіль @{target} видалено (статичний, якщо є, "
+                f"знову активний)." if ok else
+                f"У @{target} немає динамічного профіля.")
+            return
+        if user_profiles.set_style(target, payload):
+            await message.answer(
+                f"✅ Профіль @{target} збережено ({len(payload)} символів).")
+        else:
+            await message.answer(
+                "⚠️ Порожній текст — нічого не зберіг.")
 
     @dp.message(Command("status"), IsAdmin())
     async def cmd_status(message: Message):
@@ -648,6 +707,8 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         else:
             alive = "—"
         lines.append(f"🫀 Фонові циклі: {alive}")
+        persona_name = "Гога 🇬🇪" if persona.mode() == "goga" else "Башмак"
+        lines.append(f"🎭 Персона: {persona_name}")
 
         await message.answer("\n".join(lines))
 
@@ -673,7 +734,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
     @dp.message(Command("gadalka"))
     async def cmd_gadalka(message: Message):
         sender = message.from_user.full_name if message.from_user else "Хтось"
-        context = get_public_context(message)  # лише style, без sensitive
+        context = get_public_context(message)  # публічний контекст людини
         recent = bot_state.get_history(message.chat.id)[-10:]
 
         prompt = (
@@ -728,7 +789,7 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
     # /start і /help обробляє cmd_start (раніше вони дублювалися тут і ніколи
     # не спрацьовували). Лишилися лише адмінські команди: якщо їх викликає не
     # адмін — мовчки ігноруємо, а не віддаємо в загальний обробник тексту.
-    @dp.message(Command("reset", "status", "model", "features"))
+    @dp.message(Command("reset", "status", "model", "features", "profile"))
     async def cmd_denied(message: Message):
         return
 

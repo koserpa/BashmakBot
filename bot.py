@@ -21,6 +21,7 @@ from aiohttp import web
 import bot_state
 import state_store
 import tasks
+import user_memory
 from config import BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, STATE_CHAT_ID
 from handlers import idle_chat_watcher, register_handlers
 from plugins import load_plugins
@@ -146,6 +147,9 @@ async def main():
 
     tasks.spawn_watch("reminders", lambda: reminders_watcher(bot))
     log.info("Воркер нагадувань запущено")
+
+    tasks.spawn_watch("user_memory", lambda: user_memory.memory_watcher())
+    log.info("Авто-пам'ять про користувачів запущено (раз на добу)")
 
     # Background watcher tasks: тепер усі живуть у tasks.WATCHERS під
     # супервізором (фоновий цикл впав — сам задовбався, лог у Koyeb).

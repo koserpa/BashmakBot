@@ -165,6 +165,12 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
     canceled_notice = ""
     canceled = False
     changes: list[str] = []
+    # значення з БАЗОВОГО плану, які замінила зміна («як було»): топ-рівень
+    # уроку — це вже АКТУАЛЬНІ дані (хто веде тепер/де тепер). Напрям
+    # перевірено користувачем 03.11.2026: урок із ваканцією «Wakat5» у плані
+    # реально вів Natkański Piotr (топ), а «Wakat5» лежав у zmiany.
+    was_teacher = ""
+    was_room = ""
     # сирі (структурні) дані змін — для стабільного diff-підпису в
     # vulcan_notify: правка формулювання в changes НЕ має виглядати як нова
     # зміна (інакше бот шле дубль картки всім чатам)
@@ -176,12 +182,16 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
             changes.append(text)
 
     def _swap(label: str, old: Any, new: Any) -> None:
-        """«→ нове». Старе значення вже стоїть у рядку уроку (вчитель/кабінет),
-        тому не дублюємо його — інакше картка читається як повтор."""
+        """«старе → нове» в ОДНОМУ рядку: «Заміна вчителя: X → Y» читається
+        однозначно (хто був у плані і хто веде тепер), без потреби шукати
+        старе значення деінде."""
         old, new = (old or "").strip(), (new or "").strip()
         if not new:
             return
-        _add(f"{label} → {new}" if old and old != new else f"{label}: {new}")
+        if old and old != new:
+            _add(f"{label}: {old} → {new}")
+        else:
+            _add(f"{label}: {new}")
 
     moved_from = moved_to = ""
     moved_extra = ""
@@ -230,14 +240,24 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
             continue
 
         if code == 7:
-            _swap("🔄 Заміна вчителя", item.get("prowadzacy"), who)
-            _swap("🔄 Заміна кабінету", item.get("sala"), sala)
+            # «Wakat → Natkański»: у zmiany — хто БУВ у плані, топ — хто веде
+            if who:
+                _swap("🔄 Заміна вчителя", who, item.get("prowadzacy"))
+            if sala:
+                _swap("🔄 Заміна кабінету", sala, item.get("sala"))
+            if who and who != (item.get("prowadzacy") or "").strip():
+                was_teacher = who
+            if sala and sala != (item.get("sala") or "").strip():
+                was_room = sala
             if absent:
                 _add(f"ℹ️ {absent}")
             continue
 
         if code == 8:
-            _swap("🔄 Заміна кабінету", item.get("sala"), sala)
+            if sala:
+                _swap("🔄 Заміна кабінету", sala, item.get("sala"))
+                if sala != (item.get("sala") or "").strip():
+                    was_room = sala
             if not sala and absent:
                 _add(f"ℹ️ {absent}")
             continue
@@ -259,8 +279,14 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
         # невідомий код — краще показати хоч щось, ніж промовчати
         if absent:
             _add(f"ℹ️ {absent}")
-        _swap("🔄 Заміна вчителя", item.get("prowadzacy"), who)
-        _swap("🔄 Заміна кабінету", item.get("sala"), sala)
+        if who:
+            _swap("🔄 Заміна вчителя", who, item.get("prowadzacy"))
+        if sala:
+            _swap("🔄 Заміна кабінету", sala, item.get("sala"))
+        if who and who != (item.get("prowadzacy") or "").strip():
+            was_teacher = who
+        if sala and sala != (item.get("sala") or "").strip():
+            was_room = sala
         if zajecia:
             _add(f"🔀 {zajecia}" + (f" ({grupa})" if grupa else ""))
         if not (absent or who or sala or zajecia):
@@ -291,6 +317,11 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
         "subject": subject,
         "teacher": (item.get("prowadzacy") or "").strip(),
         "room": (item.get("sala") or "").strip(),
+        # «як було» в базовому плані ("" = без заміни): топ-рівень уроку
+        # вже актуальний, ці поля потрібні щоб не дублювати його в дужках
+        # картки змін і для пояснення напрямку в тестах
+        "teacher_was": was_teacher,
+        "room_was": was_room,
         "group": group,
         "changes": changes,
         "raw_changes": raw_changes,
@@ -334,6 +365,8 @@ def format_lesson_line(idx: int, l: dict) -> str:
     parts = [f"<b>{esc(l['subject'])}</b>"]
     if l["group"]:
         parts.append(f"({esc(l['group'])})")
+    # топ-рівень уроку — вже АКТУАЛЬНІ дані (при заміні портал кладе сюди
+    # того, хто реально веде); хто був у базовому плані — у рядку зміни нижче
     if l["teacher"]:
         parts.append(f"— {esc(l['teacher'])}")
     if l["room"]:

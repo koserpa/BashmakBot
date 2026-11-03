@@ -15,10 +15,10 @@ from config import (
     GEMINI_MODEL,
     GEMINI_RPD_LIMIT,
     GEMINI_TTS_MODEL,
-    SYSTEM_PROMPT,
     TTS_RPD_LIMIT,
     TTS_VOICE_NAME,
 )
+import persona
 
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
 
@@ -155,12 +155,14 @@ def parse_voice_marker(answer: str) -> tuple[bool, str]:
 
 
 def _build_system_instruction(current_date_str: str) -> str:
-    # Тон і правила поведінки — ТІЛЬКИ в SYSTEM_PROMPT (config.py).
-    # Тут лише технічні доповнення: дата, формат історії, голос.
-    # Інструкції про реакції звідси прибрано навмисно: довгий список емодзі
-    # в промпті штовхав flash-lite відповідати самими реакціями.
+    # Тон і правила поведінки — промпт АКТИВНОЇ персони (persona.py):
+    # звичайний Башмак або Гога (/swap). Читається на кожен запит, тому
+    # перемикання діє миттєво. Тут лише технічні доповнення: дата, формат
+    # історії, голос. Інструкції про реакції звідси прибрано навмисно:
+    # довгий список емодзі в промпті штовхав flash-lite відповідати
+    # самими реакціями.
     return (
-        SYSTEM_PROMPT
+        persona.current_prompt()
         + f"\n\n[Сьогоднішня дата: {current_date_str}] — врахуй це, якщо "
           "питання стосується часу, віку, дедлайнів, свят чи актуальних подій."
         + " У переписці повідомлення користувачів позначені як "

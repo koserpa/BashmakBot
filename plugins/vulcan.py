@@ -359,6 +359,31 @@ async def cmd_sprawdziany(message: Message):
     await message.reply(text)
 
 
+async def cmd_oceny(message: Message):
+    """/oceny — всі оцінки за поточний семестр + зважений середній бал."""
+    if not _vulcan_enabled():
+        await message.reply("🚫 Розклад вимкнено (VULCAN_ENABLED=false).")
+        return
+    import vulcan_notify
+    try:
+        status, text = await vulcan_notify.grades_overview_text()
+    except vulcan_utils.VulcanDisabled:
+        await message.reply(
+            "🔐 <b>VULCAN не підключено</b>: змінні <code>VULCAN_COOKIES</code> / "
+            "<code>VULCAN_LOGIN</code> не задані."
+        )
+        return
+    except vulcan_utils.VulcanError as e:
+        log.warning(f"VULCAN (oceny) помилка: {e}")
+        text = "⚠️ <b>VULCAN недоступний</b> — спробуй через хвилину."
+        status = "error"
+    # оцінок за семестр буває багато — шлемо частинами
+    parts = (vulcan_notify.split_telegram_message(text)
+             if status == "ok" else [text])
+    for part in parts:
+        await message.reply(part)
+
+
 async def cmd_vulcan_silence(message: Message):
     """/vulcan_silence — увімкнути/вимкнути проактивні сповіщення для чату."""
     if not _vulcan_enabled():
@@ -403,6 +428,14 @@ _TEXT_SPZ_RE = re.compile(
     re.IGNORECASE,
 )
 
+# «шо по оцінках», «які оцінки», «бот дай оцінки» — без команди теж працює.
+_TEXT_OCENY_RE = re.compile(
+    r"^\s*(?:(?:" + _TRIGGER_ALT + r")[\s,.!?:;]+)??"
+    r"(?:кинь|кидай|покажи|дай|даш|шо по|що по|які|какие|какі|маємо|чо по)?\s*"
+    r"(?:/oceny|\bоцінк\w*|\bоценк\w*|\bocen\w*|середн\w*\s*бал\w*)\b",
+    re.IGNORECASE,
+)
+
 
 def _addressed_to_bot(message: Message) -> bool:
     """Чи звертаються до бота: @username, ім'я-тригер (на початку/в кінці)
@@ -435,15 +468,22 @@ async def cmd_sprawdziany_text(message: Message):
     await cmd_sprawdziany(message)
 
 
+async def cmd_oceny_text(message: Message):
+    """Text-варіант зі зверненням: «шо по оцінках» / reply боту."""
+    await cmd_oceny(message)
+
+
 def register_handlers(dp) -> None:
     dp.message.register(cmd_rozklad, Command("rozklad", "schedule"))
     dp.message.register(cmd_rozklad_jutro, Command("rozklad_jutro"))
     dp.message.register(cmd_rozklad_tydzien, Command("rozklad_tydzien", "tydzien"))
     dp.message.register(cmd_rozklad_status, Command("rozklad_status", "rozklad_state", "rozklad_statuss"))
     dp.message.register(cmd_sprawdziany, Command("sprawdziany", "sprawdzian", "dz"))
+    dp.message.register(cmd_oceny, Command("oceny", "grades"))
     dp.message.register(cmd_vulcan_silence, Command("vulcan_silence", "vulcan_mute"))
     dp.message.register(cmd_rozklad_text, F.text.regexp(_TEXT_TRIGGER_RE), AddressedToBot())
     dp.message.register(cmd_sprawdziany_text, F.text.regexp(_TEXT_SPZ_RE), AddressedToBot())
+    dp.message.register(cmd_oceny_text, F.text.regexp(_TEXT_OCENY_RE), AddressedToBot())
     dp.callback_query.register(on_vulcan_callback, F.data.startswith("vulcan:"))
 
 

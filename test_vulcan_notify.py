@@ -304,6 +304,135 @@ def test_prune() -> None:
     print("  prune state + kartkówka ✓")
 
 
+def grade(subject="Matematyka", idx=0, value="5", *, weight=2.0,
+          date_="2026-11-03", category="Sprawdzian", column="Sprawdzian 1",
+          teacher="Nowak", column_id=101, subject_pos=0):
+    """Оцінка у форматі vulcan_utils.parse_grades."""
+    return {
+        "subject": subject, "subject_pos": subject_pos, "teacher": teacher,
+        "column_id": column_id, "index": idx, "category": category,
+        "column": column, "value": value, "date": date_, "weight": weight,
+        "fixed_from": None, "changed_since_login": False,
+    }
+
+
+def test_grade_diff() -> None:
+    """Diff оцінок: перший запуск — тихий seed; далі ловляться
+    нові / виправлені (5 -> 6-) / видалені оцінки."""
+    g1 = grade(idx=0, value="5")
+    g2 = grade(idx=0, value="4", weight=1, column_id=102, category="Kartkówka")
+    new, edited, removed, m = vn._compute_grade_changes([g1, g2], {}, seed=True)
+    assert (new, edited, removed) == ([], [], []) and len(m) == 2
+    # без змін — мовчимо
+    new, edited, removed, _ = vn._compute_grade_changes([g1, g2], dict(m))
+    assert (new, edited, removed) == ([], [], [])
+    # нова оцінка (інший предмет/стовпчик)
+    g3 = grade(idx=0, value="6", subject="Fizyka", column_id=201, subject_pos=1)
+    new, edited, removed, _ = vn._compute_grade_changes([g1, g2, g3], dict(m))
+    assert [g["subject"] for g in new] == ["Fizyka"]
+    assert not edited and not removed
+    # виправлення: вчитель змінив 5 -> 6-
+    fixed = grade(idx=0, value="6-")
+    new, edited, removed, _ = vn._compute_grade_changes([fixed, g2], dict(m))
+    assert not new and not removed
+    assert len(edited) == 1
+    assert edited[0][0]["value"] == "5" and edited[0][1]["value"] == "6-"
+    # видалення: оцінка зникла зі стовпчика
+    new, edited, removed, _ = vn._compute_grade_changes([g2], dict(m))
+    assert not new and not edited
+    assert len(removed) == 1 and removed[0]["value"] == "5"
+    print("  diff оцінок ✓")
+
+
+def test_grades_card() -> None:
+    """Картка оцінок: заголовок за типом змін, вага/категорія, html-escape,
+    ліміт 40 рядків (Telegram 4096)."""
+    new = [grade(idx=0, value="5")]
+    edited = [(grade(idx=1, value="5"), grade(idx=1, value="6-"))]
+    removed = [grade(idx=2, value="3", weight=1, column_id=103)]
+    card = vn.format_grades_card(new, edited, removed)
+    assert "Зміни в оцінках" in card and "Matematyka" in card
+    assert "5</b> → <b>6-" in card
+    assert "вага 2" in card and "вага 1" in card
+    # заголовок залежить від типу змін
+    assert "Нові оцінки" in vn.format_grades_card(new, [], [])
+    assert "виправлено" in vn.format_grades_card([], edited, [])
+    assert "видалено" in vn.format_grades_card([], [], removed)
+    assert vn.format_grades_card([], [], []) == ""
+    # '&' і '<' з порталу не ламають HTML-парсинг Telegram
+    bad = [grade(subject="A & B <i>x</i>", value="5")]
+    assert "A &amp; B &lt;i&gt;x&lt;/i&gt;" in vn.format_grades_card(bad, [], [])
+    # 45 нових -> 40 рядків + «… ще 5»
+    many = [grade(idx=0, value="5", subject=f"S{i}", column_id=1000 + i,
+                  subject_pos=i) for i in range(45)]
+    card = vn.format_grades_card(many, [], [])
+    assert card.count("🆕") == 40 and "ще 5" in card
+    print("  картка оцінок ✓")
+
+
+def test_grades_overview() -> None:
+    """/oceny: «5-»/«4+» -> числа, зважений середній по предметах і загальний,
+    нечислові (bz) показуються, але в середню не йдуть."""
+    assert vn.grade_numeric("5") == 5.0
+    assert vn.grade_numeric("5-") == 4.75
+    assert vn.grade_numeric("4+") == 4.25
+    assert vn.grade_numeric("6-") == 5.75
+    assert vn.grade_numeric("bz") is None
+    assert vn.grade_numeric("+") is None
+    assert vn.grade_numeric("") is None
+
+    grades = [
+        grade(subject="Matematyka", idx=0, value="5", weight=2),
+        grade(subject="Matematyka", idx=0, value="4+", weight=1, column_id=102,
+              date_="26.02.2026"),
+        grade(subject="Chemia", idx=0, value="bz", weight=1, column_id=201,
+              subject_pos=1, category="Praca klasowa"),
+        grade(subject="Fizyka", idx=0, value="6", weight=3, column_id=301,
+              subject_pos=2),
+    ]
+    # Matematyka: (5*2 + 4.25*1)/3 = 4.75; Fizyka: 6.00; загальний:
+    # (5*2 + 4.25 + 6*3)/6 = 5.375 -> 5.38
+    text = vn.format_grades_overview(grades, {"numerOkresu": 1,
+                                              "dataOd": "2026-09-01",
+                                              "dataDo": "2027-01-25"})
+    assert "Semestr 1" in text and "01.09 – 25.01" in text
+    assert "Matematyka</b> — 4.75" in text
+    assert "Fizyka</b> — 6.00" in text
+    assert "Зважений середній: 5.38" in text
+    # дати: API дає DD.MM.YYYY, періоди — ISO; обидва -> '26.02'/'03.11'
+    assert "26.02" in text and "03.11" in text
+    # нечислова оцінка видна, але середнього по предмету не дає
+    assert "bz" in text
+    assert "Chemia</b> —" not in text
+    # ваги і категорії в рядках
+    assert "вага 2" in text and "Sprawdzian" in text
+    # html-escape і порожні випадки
+    assert "A &amp; B" in vn.format_grades_overview(
+        [grade(subject="A & B", value="5")], None)
+    assert vn.format_grades_overview([], None) == ""
+    print("  огляд /oceny ✓")
+
+
+def test_oceny_triggers() -> None:
+    """Текстові тригери /oceny: «шо по оцінках», «які оцінки» — регекс
+    пильний, але в живому чаті його гейтить AddressedToBot."""
+    import plugins.vulcan as pv
+    good = [
+        "шо по оцінках",
+        "бот які оцінки",
+        "які оцінки",
+        "/oceny",
+        "бот покажи оцінки",
+        "чо по оцінках",
+    ]
+    bad = ["", None, "привіт", "розклад на завтра", "дзвінок пролунав"]
+    for t in good:
+        assert pv._TEXT_OCENY_RE.search(t or ""), f"має ловити: {t!r}"
+    for t in bad:
+        assert not pv._TEXT_OCENY_RE.search(t or ""), f"НЕ має ловити: {t!r}"
+    print("  текстові тригери оцінок ✓")
+
+
 def test_tomorrow_marks_only_after_delivery() -> None:
     """Нагадування «завтра» фіксується лише після успішної доставки.
 
@@ -379,6 +508,32 @@ def test_group_chat_is_registered() -> None:
     print("  груповий чат реєструється ✓")
 
 
+def test_changes_card_substitution() -> None:
+    """Картка змін: заміна = «як було в плані → хто веде тепер» (вакансію
+    Wakat закрив реальний вчитель), без дублю в дужках; урок без заміни
+    вчителя лишає контекст (вчитель/кабінет) у дужках."""
+    from datetime import date
+    d = date(2026, 11, 3)
+    sub = lesson("2026-11-03", "10:35", "Język polski",
+                 teacher="Natkański Piotr", room="205",
+                 changes=["🔄 Заміна вчителя: Wakat5 WAKAT POLSKI TC → "
+                          "Natkański Piotr"],
+                 raw_changes=[["prowadzacy=Wakat5 WAKAT POLSKI TC", "zmiana=7"]])
+    sub["teacher_was"] = "Wakat5 WAKAT POLSKI TC"
+    card = vn.format_changes_card(_day_name(d), "03.11", [sub])
+    # самодостатня заміна: хто був у плані -> хто веде тепер
+    assert "Wakat5 WAKAT POLSKI TC → Natkański Piotr" in card
+    # актуальний вчитель НЕ дублюється в дужках при назві предмета
+    bullet = card.split("\n")[1]
+    assert "(" not in bullet and "Natkański Piotr" in bullet
+    # урок без заміни вчителя — контекст у дужках, як і раніше
+    plain = lesson("2026-11-03", "12:00", "Matematyka", teacher="Lizurej Olga",
+                   room="204", changes=["📌 Wyjście do kina"])
+    card2 = vn.format_changes_card(_day_name(d), "03.11", [plain])
+    assert "(Lizurej Olga, каб. 204)" in card2
+    print("  картка змін: заміна «як було → хто веде» ✓")
+
+
 def _day_name(d):
     import vulcan_utils as vu
     return vu.DAY_NAMES_PL[d.weekday()]
@@ -401,5 +556,10 @@ if __name__ == "__main__":
     test_tomorrow_marks_only_after_delivery()
     test_morning_retries_when_schedule_fails()
     test_prune()
+    test_grade_diff()
+    test_grades_card()
+    test_grades_overview()
+    test_oceny_triggers()
+    test_changes_card_substitution()
     print("ALL TESTS OK")
     sys.exit(0)

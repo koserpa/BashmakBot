@@ -30,6 +30,8 @@ from config import (
     STATE_CHAT_ID,
 )
 
+import state_store
+
 log = logging.getLogger("Bashma4ek_Bot.bot_state")
 
 # Заповнюється один раз у main() під час старту — щоб не смикати get_me()
@@ -82,6 +84,35 @@ def get_history(chat_id: int) -> list[dict]:
         result.append({"role": "user", "parts": [{"text": f"[Контекст попередньої розмови]: {h['summary']}"}]})
     result.extend(h["recent"])
     return result
+
+
+def get_recent_dialog_texts(max_msgs: int = 60) -> list[str]:
+    """Тексти останніх діалогів усіх чатів (для user_memory).
+
+    Повідомлення користувачів вже лежать у форматі «Ім'я: текст», тому
+    модель бачить, хто що сказав. Повертає по одному блоку на чат."""
+    out: list[str] = []
+    for chat_id, h in _history.items():
+        msgs = list(h["recent"])[-max_msgs:]
+        if not msgs and not h["summary"]:
+            continue
+        lines: list[str] = []
+        if h["summary"]:
+            lines.append(f"[Раніше в чаті]: {h['summary']}")
+        for m in msgs:
+            text = " ".join(
+                p.get("text", "") for p in (m.get("parts") or [])
+                if isinstance(p, dict)
+            ).strip()
+            if not text:
+                continue
+            if m.get("role") == "model":
+                lines.append(f"Бот: {text}")
+            else:
+                lines.append(text)      # вже «Ім'я: повідомлення»
+        if lines:
+            out.append("\n".join(lines))
+    return out
 
 
 def append_history(chat_id: int, message: dict) -> None:
@@ -246,9 +277,10 @@ async def start_history_persistence() -> None:
     if not HISTORY_PERSIST_ENABLED or not STATE_CHAT_ID:
         log.info("history: persistence disabled (no STATE_CHAT_ID or disabled in config)")
         return
-    # Реєструємо секцію в state_store
-    import state_store
-    state_store.register("chat_history", _collect_history_for_snapshot, _apply_history_from_snapshot)
+    # Секція "chat_history" реєструється на рівні модуля (нижче) — саме тому
+    # вона встигає до state_store.start() і відновлюється зі снапшоту.
+    # Раніше реєстрація була ТУТ, після start() — і історія при рестарті
+    # не відновлювалась (latent bug, виправлено 03.11.2026).
     # Запускаємо flusher
     _history_save_task = asyncio.create_task(_history_flusher(), name="history_flusher")
     log.info("history: persistence started")
@@ -265,7 +297,12 @@ async def stop_history_persistence() -> None:
             pass
         _history_save_task = None
     # Фінальний збереження
-    import state_store
     if HISTORY_PERSIST_ENABLED and STATE_CHAT_ID:
         await state_store.save_now()
     log.info("history: persistence stopped")
+
+
+# Реєстрація секції на рівні ІМПОРТУ: state_store.start() відновлює лише
+# ті секції, що вже зареєстровані на момент завантаження снапшоту.
+state_store.register("chat_history", _collect_history_for_snapshot,
+                     _apply_history_from_snapshot)
