@@ -122,6 +122,38 @@ def test_gemini_client_uses_persona() -> None:
     print("  gemini_client читає активну персону ✓")
 
 
+def test_utility_calls_ignore_persona() -> None:
+    """use_persona=False (сумаризація, витягування пам'яті) — завжди
+    нейтральний дефолтний промпт, навіть у режимі Гоги/Рози; а в режимах
+    персон «мозкові» правила повертаються спільним блоком."""
+    import inspect
+
+    import gemini_client
+
+    persona.set_mode("roza")
+    neutral = gemini_client._build_system_instruction(
+        "2026-11-03", use_persona=False)
+    assert "Башмак" in neutral and "Роза" not in neutral
+
+    # boilerplate: у не-дефолтних персон «мозкові» правила є
+    goga_sys = gemini_client._build_system_instruction(
+        "2026-11-03", use_persona=True)
+    assert "МАНЕРА МОВИ" in goga_sys, "спільний блок точності відсутній"
+    assert "фото" in goga_sys
+
+    # у дефолтної персони правила вже в SYSTEM_PROMPT — дубль не потрібен
+    persona.set_mode("default")
+    default_sys = gemini_client._build_system_instruction(
+        "2026-11-03", use_persona=True)
+    assert "МАНЕРА МОВИ" not in default_sys
+
+    # ask_gemini приймає use_persona (сумісна сигнатура для службових дзвінків)
+    sig = inspect.signature(gemini_client.ask_gemini)
+    assert "use_persona" in sig.parameters
+    persona.set_mode("default")
+    print("  службові виклики поза персоною + boilerplate ✓")
+
+
 if __name__ == "__main__":
     test_personas_registry()
     test_toggle_cycle()
@@ -130,5 +162,6 @@ if __name__ == "__main__":
     test_set_mode_guards()
     test_snapshot_roundtrip_and_garbage()
     test_gemini_client_uses_persona()
+    test_utility_calls_ignore_persona()
     print("ALL TESTS OK")
     sys.exit(0)

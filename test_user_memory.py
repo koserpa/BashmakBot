@@ -129,8 +129,10 @@ def test_run_once_with_fake_gemini() -> None:
     um.note_user("koserpa", "Костя Кравченко")
     calls = []
 
-    async def fake_ask(contents, current_date_str):
+    async def fake_ask(contents, current_date_str, **kwargs):
         calls.append(current_date_str)
+        # службовий виклик мусить іти поза персоною
+        assert kwargs.get("use_persona") is False
         return '```json\n{"koserpa": ["купив нову відеокарту"]}\n```'
 
     saved_ask = gemini_client.ask_gemini

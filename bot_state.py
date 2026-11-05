@@ -182,10 +182,13 @@ async def _summarize_chat(chat_id: int) -> None:
             f"ДІАЛОГ:\n{dialog_text}"
         )
 
-        # Використовуємо Gemini для сумаризації
+        # Використовуємо Gemini для сумаризації. use_persona=False: summary
+        # пишеться в контекст назавжди — під персоною Гоги/Рози воно б
+        # «заговорило» і отруювало кожну подальшу розмову
         from gemini_client import ask_gemini
         current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        summary = await ask_gemini([{"role": "user", "parts": [{"text": prompt}]}], current_date)
+        summary = await ask_gemini([{"role": "user", "parts": [{"text": prompt}]}], current_date,
+                                   use_persona=False)
 
         if summary and len(summary.strip()) > 10:
             # Мерджуємо з існуючим summary
@@ -196,7 +199,8 @@ async def _summarize_chat(chat_id: int) -> None:
                     "Об'єднай два підсумки в один (3-4 речення), без втрати фактів.\n\n"
                     f"СТАРИЙ:\n{old_summary}\n\nНОВИЙ:\n{summary}"
                 )
-                merged = await ask_gemini([{"role": "user", "parts": [{"text": merge_prompt}]}], current_date)
+                merged = await ask_gemini([{"role": "user", "parts": [{"text": merge_prompt}]}], current_date,
+                                          use_persona=False)
                 if merged and len(merged.strip()) > 10:
                     h["summary"] = merged.strip()
                 else:

@@ -191,8 +191,11 @@ async def run_once(today: datetime | None = None) -> bool:
 
     from gemini_client import ask_gemini
     try:
+        # use_persona=False: витягування — службовий виклик, факти мають
+        # бути нейтральними, без акценту Гоги/Рози
         raw = await ask_gemini(
-            [{"role": "user", "parts": [{"text": prompt}]}], today_iso)
+            [{"role": "user", "parts": [{"text": prompt}]}], today_iso,
+            use_persona=False)
     except Exception as e:
         log.warning(f"user_memory: запит до Gemini не вдався ({e})")
         return False                 # повтор наступного циклу

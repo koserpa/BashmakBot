@@ -19,6 +19,7 @@ from config import (
     TTS_RPD_LIMIT,
     TTS_VOICE_NAME,
 )
+import config
 import persona
 
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
@@ -62,9 +63,12 @@ ALLOWED_REACTIONS = {
 _gemini_sem = asyncio.Semaphore(5)
 
 
-async def ask_gemini(contents, current_date_str):
+async def ask_gemini(contents, current_date_str, *, use_persona: bool = True):
+    """use_persona=False — службові виклики (сумаризація, витягування
+    пам'яті): нейтральний дефолтний промпт замість активної персони."""
     async with _gemini_sem:
-        return await _ask_gemini_inner(contents, current_date_str)
+        return await _ask_gemini_inner(contents, current_date_str,
+                                       use_persona=use_persona)
 
 
 # --- Лічильник запитів до Gemini (для /model, без походу в логи) -----------
@@ -155,15 +159,36 @@ def parse_voice_marker(answer: str) -> tuple[bool, str]:
     return False, answer
 
 
-def _build_system_instruction(current_date_str: str) -> str:
-    # Тон і правила поведінки — промпт АКТИВНОЇ персони (persona.py):
-    # звичайний Башмак або Гога (/swap). Читається на кожен запит, тому
-    # перемикання діє миттєво. Тут лише технічні доповнення: дата, формат
-    # історії, голос. Інструкції про реакції звідси прибрано навмисно:
-    # довгий список емодзі в промпті штовхав flash-lite відповідати
-    # самими реакціями.
+# Спільний «мозковий» блок для НЕ-дефолтних персон: рольplay-промпт
+# витісняє правила з дефолтного SYSTEM_PROMPT (робота з медіа, довжина,
+# точність), і без цього блоку Гога/Роза реально тупішають.
+_PERSONA_BOILERPLATE = (
+    "\n\n[ЗАГАЛЬНЕ — діє незалежно від персони]: характер — це МАНЕРА МОВИ, "
+    "а не зниження інтелекту. Спершу дай правильну, корисну відповідь по "
+    "суті, потім додавай образ. Фактів не вигадуй; не знаєш — чесно скажи. "
+    "На фото, стікери, гіфки, голосові та файли реагуй по суті питання "
+    "користувача, а не сухим звітом про вміст. Не починай відповідь з "
+    "імені людини без потреби. Довжина — за ситуацією: просте питання — "
+    "1-2 речення; просять пояснити чи дати дані — чітко по пунктах."
+)
+
+
+def _build_system_instruction(current_date_str: str, use_persona: bool = True) -> str:
+    # Промпт активної персони (persona.py): звичайний Башмак або Гога/Роза
+    # (/swap). Читається на кожен запит, тому перемикання діє миттєво.
+    # Службові виклики (сумаризація, витягування пам'яті) передають
+    # use_persona=False — їхні результати потрапляють у контекст назавжди
+    # і мають бути нейтральними. Тут лише технічні доповнення: дата, формат
+    # історії, голос.
+    if use_persona:
+        base = persona.current_prompt()
+        # дефолтна персона вже містить усі «мозкові» правила
+        if persona.mode() != "default":
+            base += _PERSONA_BOILERPLATE
+    else:
+        base = config.PERSONAS["default"]["prompt"]
     return (
-        persona.current_prompt()
+        base
         + f"\n\n[Сьогоднішня дата: {current_date_str}] — врахуй це, якщо "
           "питання стосується часу, віку, дедлайнів, свят чи актуальних подій."
         + " У переписці повідомлення користувачів позначені як "
@@ -237,9 +262,11 @@ def _extract_retry_after(e: errors.ClientError) -> int | None:
     return None
 
 
-async def _ask_gemini_inner(contents: list, current_date_str: str) -> str:
+async def _ask_gemini_inner(contents: list, current_date_str: str,
+                            *, use_persona: bool = True) -> str:
     last_error: Exception | None = None
-    system_instruction = _build_system_instruction(current_date_str)
+    system_instruction = _build_system_instruction(
+        current_date_str, use_persona=use_persona)
 
     for attempt in range(GEMINI_MAX_RETRIES + 1):
         # на останній спробі пробуємо запасну модель, якщо вона задана
