@@ -197,6 +197,21 @@ async def build_reply_media_context(
                 if transcript:
                     description = f"[у відповідь на кружок]: {transcript}"
 
+        else:
+            # звичайний ТЕКСТ — найчастіший випадок: reply на чуже
+            # повідомлення + тег бота. Без цього бот відповідав «наосліп»,
+            # не бачачи, на що саме йому відповідають
+            text = (replied.text or "").strip()
+            if text:
+                who = ""
+                if replied.from_user:
+                    who = (replied.from_user.full_name
+                           or (f"@{replied.from_user.username}"
+                               if replied.from_user.username else ""))
+                who_part = f" від {who}" if who else ""
+                description = (f"[у відповідь на повідомлення{who_part}]: "
+                               f"«{text[:800]}»")
+
     except Exception:
         log.exception("Не вдалось підвантажити медіа з reply_to_message")
         return [], ""

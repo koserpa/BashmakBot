@@ -27,6 +27,7 @@ from config import (
     HISTORY_SUMMARY_THRESHOLD,
     HISTORY_RECENT_KEEP,
     HISTORY_SAVE_INTERVAL_SEC,
+    HISTORY_MSG_MAX_CHARS,
     STATE_CHAT_ID,
 )
 
@@ -116,9 +117,21 @@ def get_recent_dialog_texts(max_msgs: int = 60) -> list[str]:
 
 
 def append_history(chat_id: int, message: dict) -> None:
-    """Додає повідомлення в історію, позначає dirty, можливо тригерить сумаризацію."""
+    """Додає повідомлення в історію, позначає dirty, можливо тригерить сумаризацію.
+
+    Тексти обрізаються до HISTORY_MSG_MAX_CHARS: транскрипти голосових/
+    документів бувають на тисячі символів — без капа вони назавжди сидять
+    в історії (снапшот + кожен запит до Gemini)."""
     h = _history[chat_id]
-    h["recent"].append(message)
+    capped = {
+        "role": message.get("role"),
+        "parts": [
+            {"text": str(p.get("text", ""))[:HISTORY_MSG_MAX_CHARS]}
+            if isinstance(p, dict) else p
+            for p in (message.get("parts") or [])
+        ],
+    }
+    h["recent"].append(capped)
     h["dirty"] = True
     _maybe_trigger_summarization(chat_id)
 

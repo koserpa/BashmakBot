@@ -57,6 +57,7 @@ class FakeBot:
         self.sent: list[bytes] = []
         self.edits: list[bytes] = []
         self.pinned_calls: list[int] = []
+        self.deleted: list[int] = []
         self._next_id = 100
 
     async def get_chat(self, chat_id):
@@ -86,6 +87,9 @@ class FakeBot:
             raise self.edit_error(method=None, message="message can't be edited")
         self.edits.append(media.media.data)
         self.blob = media.media.data
+
+    async def delete_message(self, chat_id, message_id, **kwargs):
+        self.deleted.append(message_id)
 
 
 def _section(name: str, box: dict, key: str = "value"):
@@ -218,6 +222,57 @@ def test_foreign_pinned_document_creates_own() -> None:
     print("  чужий закріплений документ не блокує ✓")
 
 
+def test_checkpoint_daily_and_prune() -> None:
+    """Щоденний чекпоінт: одна копія на день, старі видаляються (KEEP=2)."""
+    ss.reset_for_tests()
+    box = {"value": {}}
+    _section("test_vn", box)
+    bot = FakeBot()
+    keep_saved = ss.CHECKPOINT_KEEP
+    ss.CHECKPOINT_KEEP = 2
+
+    async def run():
+        await ss.start(bot, 555)              # створює снапшот
+        n_before = len(bot.sent)
+        await ss._maybe_checkpoint()          # перший чекпоінт
+        assert len(bot.sent) == n_before + 1
+        assert ss._checkpoint_day and len(ss._checkpoint_ids) == 1
+        # той самий день — дубля немає
+        await ss._maybe_checkpoint()
+        assert len(bot.sent) == n_before + 1
+        # «наступний день» — новий чекпоінт; при KEEP=2 найстаріший видаляється
+        ss._checkpoint_day = "2000-01-01"
+        await ss._maybe_checkpoint()
+        assert len(ss._checkpoint_ids) == 2 and not bot.deleted
+        ss._checkpoint_day = "2000-01-01"
+        await ss._maybe_checkpoint()
+        assert len(ss._checkpoint_ids) == 2
+        assert bot.deleted == [ss._checkpoint_ids[0] - 1]  # прибрано найстаріший
+        # статистика віддає кількість чекпоінтів
+        assert ss.snapshot_stats()["checkpoints"] == 2
+        await ss.stop()
+
+    try:
+        asyncio.run(run())
+    finally:
+        ss.CHECKPOINT_KEEP = keep_saved
+    print("  щоденний чекпоінт + prune ✓")
+
+
+def test_snapshot_stats() -> None:
+    """/snapshot-статистика: розмір, розкладка по секціях, деталі."""
+    ss.reset_for_tests()
+    box = {"value": {"chat_ids": [1, -2], "lesson_changes": {"k": "sig"}}}
+    _section("test_vn", box)
+    stats = ss.snapshot_stats()
+    assert stats["size_bytes"] > 0
+    assert stats["sections_bytes"]["test_vn"] > 0
+    assert stats["checkpoints"] == 0
+    # вагоміша секція має більший байт-вагу (санітарна перевірка сортування)
+    assert isinstance(stats["details"], dict)
+    print("  snapshot_stats ✓")
+
+
 def test_disabled_without_chat() -> None:
     ss.reset_for_tests()
     bot = FakeBot()
@@ -239,5 +294,7 @@ if __name__ == "__main__":
     test_broken_json_not_overwritten()
     test_recreate_when_edit_fails()
     test_foreign_pinned_document_creates_own()
+    test_checkpoint_daily_and_prune()
+    test_snapshot_stats()
     test_disabled_without_chat()
     print("ALL TESTS OK")
