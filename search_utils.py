@@ -62,13 +62,37 @@ MAX_FETCH_CHARS = 1500          # символів на результат (бу
 # Маркер, який підмішується в промпт при невдалому пошуку
 SEARCH_FAILED_MARKER = "__SEARCH_FAILED__"
 
-IMAGE_SEARCH_TRIGGERS = {
-    "покажи", "покажі", "як виглядає", "як виглядають", "фото", "фотк*",
-    "картинк*", "зображенн*",
-    "покажи фото", "пришли фото",
-    "как выглядит", "как выглядят", "изображени*",
-}
-_IMAGE_MATCHER = build_matcher(IMAGE_SEARCH_TRIGGERS)
+# Запит картинки = ДІЯ (покажи / скинь / пришли ...) + ОБ'ЄКТ (фото / картинка / ...)
+# в одному повідомленні. Голі слова «фото»/«фотки» БЕЗ дії — НЕ запит:
+# «ти заєбав фото кидать», «ты выслал фотки» — скарги, а не прохання,
+# і кидати картинки у відповідь на них — найгірша можливa реакція.
+# Окреме «як виглядає» залишається тригером без дії (як раніше).
+_IMAGE_ACTION_RE = re.compile(
+    r"(?<!\w)(?:покажі?|показать|показуй|скинь|кинь|надішл\w*|пришл\w*"
+    r"|пошукай|знайд\w*|найд\w*|поищ\w*|погугл\w*|загугл\w*|гугл\w*)",
+    re.IGNORECASE,
+)
+_IMAGE_NOUN_RE = re.compile(
+    r"(?<!\w)(?:фото\w*|фотк\w*|фотографі\w*|картинк\w*|зображенн\w*"
+    r"|мем\w*|гіфк\w*|гифк\w*|гіф\w*|gif)",
+    re.IGNORECASE,
+)
+_IMAGE_LOOKS_RE = re.compile(
+    r"(?<!\w)(?:як вигляда\w*|как выгляди\w*)",
+    re.IGNORECASE,
+)
+
+# Службові мітки, які бот сам додає в question_text («[у відповідь на фото]»,
+# «(підпис до фото: ...)») — це опис контексту, а не бажання користувача
+# отримати картинку, тому перед детекцією вирізаємо їх.
+_SERVICE_LABEL_RE = re.compile(r"\[[^\]]*\]|\(підпис до [^)]*\)")
+
+
+def is_image_query(text: str) -> bool:
+    text = _SERVICE_LABEL_RE.sub(" ", text or "")
+    if _IMAGE_LOOKS_RE.search(text):
+        return True
+    return bool(_IMAGE_ACTION_RE.search(text) and _IMAGE_NOUN_RE.search(text))
 
 # Ключові слова для новинного запиту
 _NEWS_KEYWORDS = {
@@ -78,10 +102,6 @@ _NEWS_KEYWORDS = {
     "what happened", "breaking",
 }
 _NEWS_MATCHER = build_matcher(_NEWS_KEYWORDS)
-
-
-def is_image_query(text: str) -> bool:
-    return bool(_IMAGE_MATCHER.search(text or ""))
 
 
 def _is_news_query(query: str) -> bool:
