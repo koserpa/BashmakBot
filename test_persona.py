@@ -26,11 +26,11 @@ def test_personas_registry() -> None:
 
 
 def test_toggle_cycle() -> None:
-    """/swap без аргументу: по колу default -> goga -> roza -> default."""
+    """/swap без аргументу: по колу, довжина = кількість персон."""
     persona.set_mode("default")
-    assert persona.toggle() == "goga"
-    assert persona.toggle() == "roza"
-    assert persona.toggle() == "default"
+    for _ in range(len(persona.MODES)):
+        persona.toggle()
+    assert persona.mode() == "default"  # після повного колу — назад
     # прямий вибір
     assert persona.set_mode("roza")
     assert persona.mode() == "roza"
@@ -51,8 +51,8 @@ def test_prompts_distinct() -> None:
     persona.set_mode("roza")
     roza_prompt = persona.current_prompt()
     assert "Роза" in roza_prompt and "квіткарка" in roza_prompt
-    # межі вшиті в промпт: без явних сцен навіть коли просять
-    assert "НЕ описуєш" in roza_prompt and "по запису" in roza_prompt
+    # у промпті Рози лишилась тема просяних сцен (текст власника)
+    assert "описуєш оголеність" in roza_prompt
     print("  промпти персон ✓")
 
 
@@ -123,9 +123,9 @@ def test_gemini_client_uses_persona() -> None:
 
 
 def test_utility_calls_ignore_persona() -> None:
-    """use_persona=False (сумаризація, витягування пам'яті) — завжди
-    нейтральний дефолтний промпт, навіть у режимі Гоги/Рози; а в режимах
-    персон «мозкові» правила повертаються спільним блоком."""
+    """use_persona=False (сумаризація, витягування пам'яті) — тільки
+    спільне ядро, без жодного характеру; а в режимах персон ядро
+    склеєне з характером автоматично (config.PERSONAS)."""
     import inspect
 
     import gemini_client
@@ -133,25 +133,26 @@ def test_utility_calls_ignore_persona() -> None:
     persona.set_mode("roza")
     neutral = gemini_client._build_system_instruction(
         "2026-11-03", use_persona=False)
-    assert "Башмак" in neutral and "Роза" not in neutral
+    assert "Роза" not in neutral and "Башмак" not in neutral
+    assert "ФАКТИ" in neutral, "ядро (правила якості) відсутнє"
 
-    # boilerplate: у не-дефолтних персон «мозкові» правила є
+    # персон-режим: ядро склеєне з характером в config.PERSONAS
     goga_sys = gemini_client._build_system_instruction(
         "2026-11-03", use_persona=True)
     assert "МАНЕРА МОВИ" in goga_sys, "спільний блок точності відсутній"
     assert "фото" in goga_sys
 
-    # у дефолтної персони правила вже в SYSTEM_PROMPT — дубль не потрібен
+    # у дефолтної персони ядро теж склеєне один раз (в config.PERSONAS)
     persona.set_mode("default")
     default_sys = gemini_client._build_system_instruction(
         "2026-11-03", use_persona=True)
-    assert "МАНЕРА МОВИ" not in default_sys
+    assert "МАНЕРА МОВИ" in default_sys
 
     # ask_gemini приймає use_persona (сумісна сигнатура для службових дзвінків)
     sig = inspect.signature(gemini_client.ask_gemini)
     assert "use_persona" in sig.parameters
     persona.set_mode("default")
-    print("  службові виклики поза персоною + boilerplate ✓")
+    print("  службові виклики поза персоною + ядро/характер ✓")
 
 
 if __name__ == "__main__":

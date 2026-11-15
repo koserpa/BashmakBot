@@ -150,16 +150,24 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
         raise VulcanBadData("урок без поля 'data'")
     subject = (item.get("przedmiot") or "").strip() or "(без назви)"
 
-    # --- розшифровка замін (поле 'zmiany', коди — за живим трафіком портала) ---
+    # --- розшифровка замін (поле 'zmiany', коди — за живим трафіком портала,
+    # напрямок перенесень звірено з тим, що реально було в школі 10.11.2026) ---
     #   1  = урок відмінено / необхідність не йти (informacjeNieobecnosc = причина,
     #        напр. "uczniowie zwolnieni do domu" -> учнів відпустили додому)
     #   4  = клас/група йде на захід ("Wyjście do kina", "wycieczka") — це НЕ
     #        відміна, а примітка до уроку!
-    #   5  = урок перенесено З іншого часу (godzinaOd — звідки)
-    #   6  = урок перенесено НА інший час (godzinaOd — куди)
+    #   5  = урок перенесено З ЦЬОГО слота (godzinaOd/dzien — КУДИ; рядок
+    #        прив'язаний до СТАРОГО часу — сам урок тут більше не буде)
+    #   6  = урок перенесено В ЦЕЙ слот (godzinaOd/dzien — ЗВІДКИ; рядок
+    #        прив'язаний до НОВОГО часу — сам урок тут і буде)
     #   7  = заміна вчителя (prowadzacy = хто веде), іноді зі зміною кабінету
     #   8  = заміна кабінету (sala = новий кабінет)
+    #   14 = до заняття приєднали інший КЛАС (аналог 15; власник: 13.11.2026
+    #        приєднали 3TC)
     #   15 = зміна групи / заняття разом з іншою групою (zajecia, grupa)
+    # Портал віддає ОДНЕ перенесення ДВАЧИ: рядок на старому часі (код 5) і
+    # рядок на новому (код 6) — тому старий рядок малюємо закресленим, а не
+    # як звичайний урок (інакше розклад роздувається фейковими парами).
     # Невідомі коди не ігноруємо: показуємо все, що є в полях, щоб не
     # загубити зміну, якщо портал додасть новий тип.
     canceled_notice = ""
@@ -193,8 +201,23 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
         else:
             _add(f"{label}: {new}")
 
-    moved_from = moved_to = ""
-    moved_extra = ""
+    moved_from = moved_to = ""            # "HH:MM"
+    moved_from_day = moved_to_day = ""    # ISO-дата (перенесення може бути через день)
+    moved_extra = ""                      # назва предмету, якщо перенесли інший урок
+    # рядок старого слота (є код 5 і нема код 15): урок звідси забрали —
+    # в дні малюємо закресленим і не рахуємо в «Уроків»
+    moved_away = False
+    # «Заміна на: X (група)» у структурованому вигляді: якщо урок X є в плані
+    # на той самий час окремим рядком — рядок-джерело повністю поглинається
+    replaced_by: dict[str, str] | None = None
+
+    # код 15/14 (спільне заняття) можуть йти ПІСЛЯ коду 5 у списку, тому
+    # факт спільного заняття знаємо заздалегідь: слот із спільним уроком —
+    # не «порожній»
+    has_join = any(
+        isinstance(z, dict) and z.get("zmiana") in (14, 15)
+        for z in (item.get("zmiany") or [])
+    )
 
     for z in item.get("zmiany") or []:
         if not isinstance(z, dict):
@@ -227,14 +250,18 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
                 _add(f"📌 {absent}")
             continue
 
-        if code == 5:                       # перенесено З
-            moved_from = moved_from or _hhmm(z.get("godzinaOd"))
+        if code == 5:                       # перенесено З ЦЬОГО слота (куди — в зміні)
+            if not has_join:
+                moved_away = True
+            moved_to = moved_to or _hhmm(z.get("godzinaOd"))
+            moved_to_day = moved_to_day or (z.get("dzien") or "")[:10]
             if zajecia and zajecia != subject:
                 moved_extra = zajecia
             continue
 
-        if code == 6:                       # перенесено НА
-            moved_to = moved_to or _hhmm(z.get("godzinaOd"))
+        if code == 6:                       # перенесено В ЦЕЙ слот (звідки — в зміні)
+            moved_from = moved_from or _hhmm(z.get("godzinaOd"))
+            moved_from_day = moved_from_day or (z.get("dzien") or "")[:10]
             if zajecia and zajecia != subject:
                 moved_extra = zajecia
             continue
@@ -262,12 +289,25 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
                 _add(f"ℹ️ {absent}")
             continue
 
+        if code == 14:
+            # 14 = до заняття приєднали ІНШИЙ КЛАС (звірено з власником
+            # 15.11.2026: 13.11 14:05, приєднали 3TC — як з Edukacją
+            # zdrowotną раніше). Аналог 15, але клас, не підгрупа.
+            suffix = f" ({grupa})" if grupa else ""
+            if zajecia and zajecia != subject:
+                _add(f"🔀 Заміна на: {zajecia}{suffix}")
+                replaced_by = {"subject": zajecia, "group": grupa}
+            else:
+                _add(f"🔀 Заняття разом з іншим класом{suffix}")
+            continue
+
         if code == 15:
             # 15 = заняття разом з іншою групою: свій предмет уже в рядку уроку,
             # тому показуємо тільки НА що заміна (без повтору назви).
             suffix = f" ({grupa})" if grupa else ""
             if zajecia and zajecia != subject:
                 _add(f"🔀 Заміна на: {zajecia}{suffix}")
+                replaced_by = {"subject": zajecia, "group": grupa}
             elif zajecia:
                 _add(f"🔀 Заняття разом з іншою групою{suffix}")
             elif grupa:
@@ -294,12 +334,21 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
 
     if moved_from or moved_to:
         where = f" ({moved_extra})" if moved_extra else ""
-        if moved_from and moved_to and moved_from != moved_to:
-            _add(f"🕒 Перенесено: {moved_from} → {moved_to}{where}")
+
+        def _when(hhmm: str, day_iso: str) -> str:
+            # "11:25"; якщо перенесення через день — "18.11, 11:25"
+            if day_iso and day_iso != day:
+                d_part = f"{day_iso[8:10]}.{day_iso[5:7]}" if len(day_iso) >= 10 else day_iso
+                return f"{d_part}, {hhmm}" if hhmm else d_part
+            return hhmm
+
+        f_from, f_to = _when(moved_from, moved_from_day), _when(moved_to, moved_to_day)
+        if moved_from and moved_to:
+            _add(f"🕒 Перенесено: з {f_from} на {f_to}{where}")
         elif moved_from:
-            _add(f"🕒 Перенесено з {moved_from}{where}")
+            _add(f"🕒 Перенесено з {f_from}{where}")
         else:
-            _add(f"🕒 Перенесено на {moved_to}{where}")
+            _add(f"🕒 Перенесено на {f_to}{where}")
 
     raw_notes = [
         n.strip() for n in (item.get("zmianyUwagi") or [])
@@ -328,6 +377,10 @@ def lesson_from_raw(item: Any) -> dict[str, Any]:
         "raw_notes": raw_notes,
         "canceled": canceled,
         "cancel_notice": canceled_notice,
+        # старий слот перенесеного уроку (закреслюється, не рахується) та
+        # «на що замінили» (поглинається рядом самого уроку-заміни)
+        "moved_away": moved_away and not canceled,
+        "replaced_by": replaced_by,
         "realized": bool(item.get("zrealizowane")),
     }
 
@@ -358,6 +411,7 @@ def _translate_notice(notice: str) -> str:
 def format_lesson_line(idx: int, l: dict) -> str:
     t = f"<code>{l['start']}-{l['end']}</code>" if l["start"] and l["end"] else "<code>--:--</code>"
     canceled = bool(l.get("canceled"))
+    moved_away = bool(l.get("moved_away")) and not canceled
     # дані з порталу екрануємо: '&' або '<' у назві інакше ламає HTML-парсинг
     # Telegram (повідомлення відхиляється цілком -> заміна не доходить).
     esc = lambda v: html.escape(str(v), quote=False)
@@ -380,13 +434,35 @@ def format_lesson_line(idx: int, l: dict) -> str:
             line += f"\n      ↳ відмінено: {esc(l['cancel_notice'])}"
         else:
             line += "\n      ↳ заняття відмінено"
+    elif moved_away:
+        # старий слот перенесеного уроку: пари тут нема (урок тепер на
+        # іншому часу — окремим рядком), тому закреслюємо
+        line = f"🕒 <s>{idx}. {t} {main}</s>"
     for c in l["changes"]:
         line += f"\n      {esc(c)}"
     return line
 
 
+def _absorb_replacements(lessons: list[dict]) -> list[dict]:
+    """Рядок з «Заміна на: X (група)» поглинається рядом самого уроку X,
+    якщо портал віддає його окремим рядком на той самий час (слот, де
+    групу долучили до іншої). Без цього день показує один слот двічі."""
+    existing = {
+        (l.get("date"), l.get("start"), l.get("end"), l.get("subject"))
+        for l in lessons
+    }
+    out = []
+    for l in lessons:
+        rb = l.get("replaced_by")
+        if rb and (l.get("date"), l.get("start"), l.get("end"), rb.get("subject")) in existing:
+            continue
+        out.append(l)
+    return out
+
+
 def format_day(title: str, lessons: list[dict], *, extra: str = "") -> str:
     """HTML-текст розкладу на день."""
+    lessons = _absorb_replacements(lessons)
     head = f"📅 <b>{title}</b>"
     if extra:
         head += f" {extra}"
@@ -396,8 +472,11 @@ def format_day(title: str, lessons: list[dict], *, extra: str = "") -> str:
     ordered = sorted(lessons, key=lambda x: (x["start"], x["end"]))
     for i, l in enumerate(ordered, start=1):
         lines.append(format_lesson_line(i, l))
-    canceled_n = sum(1 for l in ordered if l.get("canceled"))
-    summary = f"🧮Уроків: {len(ordered)}"
+    # перенесені звідси рядки — не пари (урок рахується на новому часу),
+    # тому в «Уроків» не потрапляють
+    counted = [l for l in ordered if not l.get("moved_away")]
+    canceled_n = sum(1 for l in counted if l.get("canceled"))
+    summary = f"🧮Уроків: {len(counted)}"
     if canceled_n:
         summary += f" • відмінено: {canceled_n}❌"
     lines.append(summary)

@@ -17,11 +17,10 @@ up._profiles = {}
 
 
 def test_profiles_override() -> None:
-    """/profile: динамічний перекриває статичний; id-ключі для тих, хто
-    писав у чат; legacy username-ключі читаються; снапшот roundtrip."""
-    static_style = up.get_style(username="koserpa")
-    assert static_style and up.source(username="koserpa") == "static"
-    assert up.get_style(username="@KOSERPA") == static_style
+    """/profile: статичних профілів (USER_CONTEXT) більше немає — рішення
+    власника 15.11.2026. Усе з динаміки: легасі username-ключі та id-ключі
+    для тих, хто писав у чат; динамічний перекриває легасі; снапшот."""
+    assert up.get_style(username="koserpa") == ""  # статичних нема
 
     # динамічний під username (легасі-шлях)
     assert up.set_style(username="koserpa", text="Тестовий профіль")
@@ -49,8 +48,7 @@ def test_profiles_override() -> None:
     # видалення: і id-, і username-варіанти
     assert up.delete_profile(username="nevidomiy") is False
     assert up.delete_profile(user_id=111, username="koserpa")
-    assert up.get_style(user_id=111, username="koserpa") == static_style
-    assert up.source(username="koserpa") == "static"
+    assert up.get_style(user_id=111, username="koserpa") == ""
     assert up.delete_profile(user_id=777)
     assert up.get_style(user_id=777) == ""
     # guard-и
@@ -61,14 +59,15 @@ def test_profiles_override() -> None:
 
 
 def test_profile_entries_listing() -> None:
-    """Список для /profile: динамічні з іменами з реєстру, статичні окремо."""
+    """Список для /profile: динамічні з іменами з реєстру (статичних нема)."""
     um._users = {"id:777": {"username": "", "name": "Без Юзера"}}
     up._profiles = {"id:777": "його профіль"}
     entries = up.profile_entries()
     labels = {e[0]: e for e in entries}
     assert "Без Юзера" in labels, "id-профіль підписується ім'ям з реєстру"
     assert labels["Без Юзера"][2] == "dynamic"
-    assert labels["koserpa"][2] == "static"
+    assert all(src == "dynamic" for _, _, src in entries), \
+        "статичних профілів більше нема (USER_CONTEXT порожній)"
     print("  /profile: список записів ✓")
 
 

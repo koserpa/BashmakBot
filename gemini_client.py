@@ -63,12 +63,15 @@ ALLOWED_REACTIONS = {
 _gemini_sem = asyncio.Semaphore(5)
 
 
-async def ask_gemini(contents, current_date_str, *, use_persona: bool = True):
+async def ask_gemini(contents, current_date_str, *, use_persona: bool = True,
+                     prompt_override: str | None = None):
     """use_persona=False — службові виклики (сумаризація, витягування
-    пам'яті): нейтральний дефолтний промпт замість активної персони."""
+    пам'яті): нейтральний дефолтний промпт замість активної персони.
+    prompt_override — власний промпт плагіна замість персони."""
     async with _gemini_sem:
         return await _ask_gemini_inner(contents, current_date_str,
-                                       use_persona=use_persona)
+                                       use_persona=use_persona,
+                                       prompt_override=prompt_override)
 
 
 # --- Лічильник запитів до Gemini (для /model, без походу в логи) -----------
@@ -159,34 +162,24 @@ def parse_voice_marker(answer: str) -> tuple[bool, str]:
     return False, answer
 
 
-# Спільний «мозковий» блок для НЕ-дефолтних персон: рольplay-промпт
-# витісняє правила з дефолтного SYSTEM_PROMPT (робота з медіа, довжина,
-# точність), і без цього блоку Гога/Роза реально тупішають.
-_PERSONA_BOILERPLATE = (
-    "\n\n[ЗАГАЛЬНЕ — діє незалежно від персони]: характер — це МАНЕРА МОВИ, "
-    "а не зниження інтелекту. Спершу дай правильну, корисну відповідь по "
-    "суті, потім додавай образ. Фактів не вигадуй; не знаєш — чесно скажи. "
-    "На фото, стікери, гіфки, голосові та файли реагуй по суті питання "
-    "користувача, а не сухим звітом про вміст. Не починай відповідь з "
-    "імені людини без потреби. Довжина — за ситуацією: просте питання — "
-    "1-2 речення; просять пояснити чи дати дані — чітко по пунктах."
-)
-
-
-def _build_system_instruction(current_date_str: str, use_persona: bool = True) -> str:
-    # Промпт активної персони (persona.py): звичайний Башмак або Гога/Роза
-    # (/swap). Читається на кожен запит, тому перемикання діє миттєво.
+def _build_system_instruction(current_date_str: str, use_persona: bool = True,
+                              prompt_override: str | None = None) -> str:
+    # Промпт активної персони (persona.py): Башмак або Гога/Роза/Козак
+    # (/swap). Кожна персона з config.PERSONAS вже містить спільне ядро
+    # (config.CORE_PROMPT) + свій характер; читається на кожен запит,
+    # тому перемикання діє миттєво.
+    # prompt_override — власний характер плагіна (напр. цитати козака):
+    # ядро додаємо самі, персона не чіпається.
     # Службові виклики (сумаризація, витягування пам'яті) передають
-    # use_persona=False — їхні результати потрапляють у контекст назавжди
-    # і мають бути нейтральними. Тут лише технічні доповнення: дата, формат
-    # історії, голос.
-    if use_persona:
+    # use_persona=False — тільки ядро, без характеру: результати потрапляють
+    # у контекст назавжди і мають бути нейтральними.
+    # Тут лише технічні доповнення: дата, формат історії, голос.
+    if prompt_override:
+        base = config.CORE_PROMPT + "\n\n" + prompt_override
+    elif use_persona:
         base = persona.current_prompt()
-        # дефолтна персона вже містить усі «мозкові» правила
-        if persona.mode() != "default":
-            base += _PERSONA_BOILERPLATE
     else:
-        base = config.PERSONAS["default"]["prompt"]
+        base = config.CORE_PROMPT
     return (
         base
         + f"\n\n[Сьогоднішня дата: {current_date_str}] — врахуй це, якщо "
@@ -263,10 +256,12 @@ def _extract_retry_after(e: errors.ClientError) -> int | None:
 
 
 async def _ask_gemini_inner(contents: list, current_date_str: str,
-                            *, use_persona: bool = True) -> str:
+                            *, use_persona: bool = True,
+                            prompt_override: str | None = None) -> str:
     last_error: Exception | None = None
     system_instruction = _build_system_instruction(
-        current_date_str, use_persona=use_persona)
+        current_date_str, use_persona=use_persona,
+        prompt_override=prompt_override)
 
     for attempt in range(GEMINI_MAX_RETRIES + 1):
         # на останній спробі пробуємо запасну модель, якщо вона задана

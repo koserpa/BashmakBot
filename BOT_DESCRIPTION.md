@@ -25,9 +25,9 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
    - Loads environment variables via python-dotenv
    - Defines bot tokens, API keys, model names
    - Contains `ENABLED_PLUGINS` — list of plugin names to load on startup
-   - Contains `USER_CONTEXT` - static user profiles (style only; sensitive field removed by owner's decision 03.11.2026)
+   - `USER_CONTEXT` is now an EMPTY dict (static profiles removed by owner's decision 15.11.2026 — kept only for import compatibility)
    - Contains `USER_MEMORY_*` knobs (daily fact extraction from chat)
-   - Holds `SYSTEM_PROMPT` - core behavioral instructions for the AI
+   - Holds `CORE_PROMPT` (shared "brain" for all personas) + character blocks (`GOGA/ROZA/KOZAK_CHARACTER_PROMPT`); `PERSONAS` registry glues them; env `SYSTEM_PROMPT` on Koyeb still overrides the default persona (legacy path)
    - Manages feature flags (via features.py)
 
 3. **bot_state.py** - Runtime State Management
@@ -84,7 +84,7 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 - Network/broken-JSON errors never overwrite a good snapshot; the background loop retries. Without `STATE_CHAT_ID` the store is a no-op.
 - The snapshot contains no tokens/passwords/cookies; its status is exposed in `/health` under `state`.
 - Chat history (`bot_state.py`) is also persisted via `state_store`: per chat `{summary, recent}`; when `recent` exceeds `HISTORY_SUMMARY_THRESHOLD` (40 messages), older messages are compressed into `summary` by Gemini. Config: `HISTORY_PERSIST_ENABLED`, `HISTORY_SUMMARY_THRESHOLD`, `HISTORY_RECENT_KEEP`, `HISTORY_SAVE_MIN_SEC`.
-- User profiles (`user_profiles.py`) and user memory (`user_memory.py`) are snapshot sections too: dynamic `/profile` overrides static `USER_CONTEXT`, and daily LLM-extracted facts (plans, events, hobbies — public-safe only) are stored per user with dates, capped at `USER_MEMORY_MAX_FACTS` with a 60-day TTL.
+- User profiles (`user_profiles.py`, dynamic `/profile` only) and user memory (`user_memory.py`) are snapshot sections too: static `USER_CONTEXT` was removed by owner, and daily LLM-extracted facts (plans, events, hobbies — public-safe only) are stored per user with dates, capped at `USER_MEMORY_MAX_FACTS` with a 60-day TTL.
 
 ## Key Features & Behaviors
 
@@ -99,9 +99,9 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
   - Secret rule: special handling for messages ending with "пж" (do literally)
 
 ### Context Awareness
-- **Sender Context**: user profile (`USER_CONTEXT` static or `/profile` dynamic) + auto-extracted facts from chat with dates (`user_memory.py`)
+- **Sender Context**: user profile (`/profile` dynamic; static `USER_CONTEXT` removed by owner) + auto-extracted facts from chat with dates (`user_memory.py`)
 - **Mentioned Users**: Extracts @username references and adds their public profiles
-- **Chat History**: Maintains rolling conversation history (configurable size)
+- **Chat History**: Maintains rolling conversation history (configurable size); AI requests use a narrow recent window (`bot_state.get_recent_context`, window=14) with the question marked at the end (`[ПИТАННЯ ...]`) so the model answers the latest question, not old threads
 - **Web Search**: Augments responses with current info when needed (via Tavily)
 - **Specialized Data**: Currency rates, weather, Polish events, school timetables
 
@@ -135,7 +135,7 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 
 ## Data Flow Example
 1. User sends message: "@Bashma4ek_Bot погода в Бытом"
-2. `handlers.py` dispatches text → gathers chat history + sender context (`bot_state`, `USER_CONTEXT`)
+2. `handlers.py` dispatches text → gathers chat history + sender context (`bot_state`, `user_profiles`)
 3. `search_utils.py` classifies the query → fetches weather from Open-Meteo
 4. `gemini_client.py` generates a short answer with the fetched data → bot replies (optionally with voice)
 
@@ -148,4 +148,6 @@ BashmakBot is a feature-rich Telegram bot designed for a group chat of friends/s
 - `/fill <текст>` — ставит напоминание через `reminder_utils` (реально отправляет в чат через `reminders_watcher`).
 - `/joke` — случайная шутка (`plugins/funny.py`).
 - `/hello` — привет (`plugins/hello.py`).
+- `/kozak` — фейкова козацька цитата (стиль «Коли замість X сказав: Y»); теж спрацьовує на слово «козак»/«kozak» у повідомленні та на reply (`plugins/kozak.py`).
+- `/swap [goga|roza|kozak|default]` — перемкнути персону бота.
 - `ENABLED_PLUGINS` в `config.py` активирует нужные.

@@ -378,10 +378,12 @@ async def process_and_reply(
     is_voice_input: bool = False,
 ) -> None:
     chat_id = message.chat.id
-    chat_history = bot_state.get_history(chat_id)
 
     image_was_requested = is_image_query(question_text)
-    full_prompt_text = f"{sender}: {question_text}"
+    # Контекстні блоки йдемо ПЕРЕД питанням, а питання — ОСТАННІМ: якщо
+    # питання закопати в середину запрошення, модель може відповісти
+    # «не на те» і приплести теми з історії.
+    context_block = ""
     image_urls: list[str] = []
     # classify_query додано, щоб запити про пари / неділі / свята / валюту /
     # погоду доходили до get_web_context, навіть якщо в тексті немає
@@ -389,33 +391,37 @@ async def process_and_reply(
     if needs_web_search(question_text) or image_was_requested or classify_query(question_text):
         web_info, image_urls = await get_web_context(
             question_text,
-            chat_history=list(chat_history)[-4:],
+            chat_history=bot_state.get_history(chat_id)[-4:],
         )
         if web_info:
-            full_prompt_text += web_info
+            context_block += web_info
 
     # Якщо просили картинку, але нічого не знайшли — говоримо моделі про це,
     # щоб вона відповіла текстом, а не реакцією.
     if image_was_requested and not image_urls:
-        full_prompt_text += "\n[Зображення не знайдено — відповідай текстом, поясни що не вдалося знайти фото]"
+        context_block += "\n[Зображення не знайдено — відповідай текстом, поясни що не вдалося знайти фото]"
 
     sender_context = get_sender_context(message)
     if sender_context:
-        full_prompt_text += f"\n[Про співрозмовника: {sender_context}]"
+        context_block += f"\n[Про співрозмовника: {sender_context}]"
     # пам'ять про компанію (домовленості/жарти/плани) — в усі розмови
     chat_facts = user_memory.get_chat_facts_text()
     if chat_facts:
-        full_prompt_text += f"\n{chat_facts}"
+        context_block += f"\n{chat_facts}"
 
     mentioned_context = get_mentioned_users_context(question_text)
     if mentioned_context:
-        full_prompt_text += mentioned_context
+        context_block += mentioned_context
+
+    full_prompt_text = (context_block + f"\n\n[ПИТАННЯ від {sender}, на яке треба відповісти]: {question_text}").lstrip()
 
     parts = [{"text": full_prompt_text}]
     if extra_parts:
         parts.extend(extra_parts)
 
-    contents = list(chat_history)
+    # вузьке вікно історії: повна історія змушує модель «приплітати» старі
+    # повідомлення замість відповіді на питання
+    contents = bot_state.get_recent_context(chat_id)
     contents.append({"role": "user", "parts": parts})
 
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
@@ -504,8 +510,7 @@ async def dispatch_media_event(
 
 async def send_idle_message(bot: Bot, chat_id: int) -> None:
     """Формує і надсилає одне проактивне повідомлення в тихий чат."""
-    chat_history = bot_state.get_history(chat_id)
-    contents = list(chat_history)
+    contents = bot_state.get_recent_context(chat_id)
     idle_hours = float(os.getenv("IDLE_HOURS", "7"))
     contents.append(
         {
@@ -738,8 +743,8 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
 
         Таргет: reply на повідомлення людини, @username або user_id числом
         (працює і для людей БЕЗ @username — тоді ключ user_id).
-        Динамічний профіль зберігається у снапшоті (user_profiles) і
-        перекриває статичний з config.USER_CONTEXT."""
+        Динамічний профіль зберігається у снапшоті (user_profiles);
+        статичних профілів більше немає (USER_CONTEXT порожній)."""
 
         def _resolve_target(arg: str) -> tuple[Any, str]:
             """'@user' / 'user' / '12345' -> (user_id, username)."""

@@ -138,28 +138,124 @@ def test_lesson_out_of_school_is_not_canceled() -> None:
 
 
 def test_lesson_moved_from_and_to() -> None:
+    # код 6: рядок на НОВОМУ часі, зміна вказує звідки прийшов урок
     raw_to = dict(RAW_PLAIN)
     raw_to["zmiany"] = [{
         "zmiana": 6, "godzinaOd": "2026-10-23T15:00:00+02:00",
         "zajecia": "Witryny i aplikacje internetowe",
     }]
-    assert any(c.startswith("🕒 Перенесено на 15:00")
-               for c in lesson_from_raw(raw_to)["changes"])
+    l_to = lesson_from_raw(raw_to)
+    assert any(c.startswith("🕒 Перенесено з 15:00")
+               for c in l_to["changes"])
+    assert l_to["moved_away"] is False
 
+    # код 5: рядок на СТАРОМУ часі, зміна вказує куди пішов урок
     raw_from = dict(RAW_PLAIN)
     raw_from["zmiany"] = [{
         "zmiana": 5, "godzinaOd": "2026-10-23T13:15:00+02:00",
     }]
-    assert any(c.startswith("🕒 Перенесено з 13:15")
-               for c in lesson_from_raw(raw_from)["changes"])
+    l_from = lesson_from_raw(raw_from)
+    assert any(c.startswith("🕒 Перенесено на 13:15")
+               for c in l_from["changes"])
+    # старий слот: урок звідси забрали (закреслюється, не рахується)
+    assert l_from["moved_away"] is True
 
-    # обидва коди на одному уроці -> один рядок «було → стало»
+    # обидва коди на одному уроці (ланцюжок) -> «з … на …»
     raw_both = dict(RAW_PLAIN)
     raw_both["zmiany"] = [
         {"zmiana": 5, "godzinaOd": "2026-10-23T13:15:00+02:00"},
         {"zmiana": 6, "godzinaOd": "2026-10-23T15:00:00+02:00"},
     ]
-    assert "🕒 Перенесено: 13:15 → 15:00" in lesson_from_raw(raw_both)["changes"]
+    l_both = lesson_from_raw(raw_both)
+    assert "🕒 Перенесено: з 15:00 на 13:15" in l_both["changes"]
+
+
+def test_lesson_move_across_days() -> None:
+    """Перенесення на інший день — у рядку зміни є дата, не лише час."""
+    raw = dict(RAW_PLAIN)
+    raw["zmiany"] = [{
+        "zmiana": 5, "dzien": "2026-10-28T00:00:00+01:00",
+        "godzinaOd": "2026-10-28T08:00:00+01:00",
+    }]
+    l = lesson_from_raw(raw)
+    assert "🕒 Перенесено на 28.10, 08:00" in l["changes"]
+    assert l["moved_away"] is True
+
+
+def test_lesson_moved_away_with_join_is_real() -> None:
+    """Слот із кодом 15 (спільне заняття) — реальний урок, хоч поруч і
+    код 5 (друга частина класу перенесена): НЕ закреслюємо."""
+    raw = dict(RAW_PLAIN)
+    raw["zmiany"] = [
+        {"zmiana": 5, "godzinaOd": "2026-10-23T13:15:00+02:00"},
+        {"zmiana": 15, "zajecia": "Przykładowy przedmiot", "grupa": "1BSb"},
+    ]
+    l = lesson_from_raw(raw)
+    assert l["moved_away"] is False
+    assert any(c.startswith("🕒 Перенесено на 13:15") for c in l["changes"])
+    assert any("Заняття разом з іншою групою" in c for c in l["changes"])
+
+
+def test_format_lesson_line_moved_away_strikethrough() -> None:
+    raw = dict(RAW_PLAIN)
+    raw["zmiany"] = [{
+        "zmiana": 5, "godzinaOd": "2026-10-23T15:00:00+02:00",
+    }]
+    line = format_lesson_line(3, lesson_from_raw(raw))
+    assert line.startswith("🕒 <s>3.")
+    assert "🕒 Перенесено на 15:00" in line
+
+
+def test_format_day_absorbs_replaced_lesson() -> None:
+    """Слот, де групу долучили до іншої: рядок «Заміна на: X» зникає, якщо
+    урок X лежить поруч окремим рядком (інакше слот видно двічі)."""
+    replaced = lesson_from_raw(dict(RAW_PLAIN))  # Przykładowy przedmiot, 08:00
+    replaced["changes"] = ["🔀 Заміна на: Inny przedmiot (2TC|t.infor.)"]
+    replaced["replaced_by"] = {"subject": "Inny przedmiot", "group": "2TC|t.infor."}
+    replacement = lesson_from_raw(dict(RAW_PLAIN))
+    replacement["subject"] = "Inny przedmiot"
+    text = format_day("Понеділок, 26.10.2026", [replaced, replacement])
+    assert "Przykładowy przedmiot" not in text
+    assert "Заміна на" not in text
+    assert "Inny przedmiot" in text
+    assert "🧮Уроків: 1" in text
+
+
+def test_format_day_keeps_replacement_note_without_item() -> None:
+    """Заміна є, але окремого рядка заміни в плані нема — показуємо рядок
+    з приміткою, як раніше (нічого не загубити)."""
+    replaced = lesson_from_raw(dict(RAW_PLAIN))
+    replaced["changes"] = ["🔀 Заміна на: Inny przedmiot (2TC|t.infor.)"]
+    replaced["replaced_by"] = {"subject": "Inny przedmiot", "group": "2TC|t.infor."}
+    text = format_day("Понеділок, 26.10.2026", [replaced])
+    assert "Заміна на: Inny przedmiot" in text
+    assert "🧮Уроків: 1" in text
+
+
+def test_format_day_moved_away_not_counted() -> None:
+    """Старий слот перенесеного уроку: закреслений і не в лічильнику «Уроків»."""
+    moved = lesson_from_raw(dict(RAW_PLAIN))
+    moved["changes"] = ["🕒 Перенесено на 11:25"]
+    moved["moved_away"] = True
+    plain = lesson_from_raw(dict(RAW_PLAIN))
+    text = format_day("Понеділок, 26.10.2026", [moved, plain])
+    assert "🧮Уроків: 1" in text
+    assert "🕒 <s>1." in text
+
+
+def test_lesson_other_class_join_code14() -> None:
+    """Код 14 = до заняття приєднали інший КЛАС (13.11.2026 приєднали 3TC).
+    Показуємо як спільне заняття, слот — реальний (не закреслений)."""
+    raw = dict(RAW_PLAIN)
+    raw["zmiany"] = [
+        {"zmiana": 5, "godzinaOd": "2026-11-13T13:15:00+01:00"},
+        {"zmiana": 14, "grupa": "3TC|t.program"},
+    ]
+    l = lesson_from_raw(raw)
+    assert any("Заняття разом з іншим класом (3TC|t.program)" in c
+               for c in l["changes"])
+    # спільний слот — реальний урок, код 5 поруч не робить його «порожнім»
+    assert l["moved_away"] is False
 
 
 def test_lesson_group_change() -> None:
@@ -170,6 +266,8 @@ def test_lesson_group_change() -> None:
     l = lesson_from_raw(raw)
     # показуємо ПЕРЕХІД, але без повтору назви уроку (вона вже в рядку)
     assert "🔀 Заміна на: Chemia (4TIR)" in l["changes"]
+    # структуровано: для поглинання дубль-рядка в format_day
+    assert l["replaced_by"] == {"subject": "Chemia", "group": "4TIR"}
     # сирі дані для стабільного diff-підпису (не залежать від формулювання)
     assert l["raw_changes"] == [["grupa=4TIR", "zajecia=Chemia", "zmiana=15"]]
 

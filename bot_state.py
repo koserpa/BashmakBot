@@ -87,6 +87,29 @@ def get_history(chat_id: int) -> list[dict]:
     return result
 
 
+AI_CONTEXT_WINDOW = 14
+
+
+def get_recent_context(chat_id: int, window: int = AI_CONTEXT_WINDOW) -> list[dict]:
+    """Історія для AI-запиту: summary + останні `window` повідомлень.
+
+    Повна історія (20+ повідомлень базару) змушує модель відповідати не
+    на останнє питання, а «приплітати» теми зі старих повідомлень. У
+    запит іде вузьке вікно; summary лишається — це єдина пам'ять про
+    давнину, і вона явно позначена як контекст."""
+    h = get_history(chat_id)
+    if not h:
+        return []
+    head: list[dict] = []
+    body = h
+    first_text = ""
+    if isinstance(h[0], dict) and h[0].get("parts"):
+        first_text = str((h[0]["parts"][0] or {}).get("text", ""))
+    if first_text.startswith("[Контекст попередньої розмови]"):
+        head, body = h[:1], h[1:]
+    return head + list(body)[-window:]
+
+
 def get_recent_dialog_texts(max_msgs: int = 60) -> list[str]:
     """Тексти останніх діалогів усіх чатів (для user_memory).
 
