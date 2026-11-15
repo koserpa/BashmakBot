@@ -22,6 +22,7 @@ import bot_state
 import state_store
 import tasks
 import user_memory
+import vulcan_utils
 from config import BOT_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, STATE_CHAT_ID
 from handlers import idle_chat_watcher, register_handlers
 from plugins import load_plugins
@@ -132,6 +133,7 @@ async def main():
     # секції) і ДО watcher'ів, щоб вони вже бачили відновлений стан.
     dp.shutdown.register(state_store.stop)
     dp.shutdown.register(bot_state.stop_history_persistence)
+    dp.shutdown.register(vulcan_utils.reset_client)
     await state_store.start(bot, STATE_CHAT_ID)
     await bot_state.start_history_persistence()
 
@@ -153,7 +155,9 @@ async def main():
 
     # Background watcher tasks: тепер усі живуть у tasks.WATCHERS під
     # супервізором (фоновий цикл впав — сам задовбався, лог у Koyeb).
-    await dp.start_polling(bot)
+    # drop_pending_updates=True — щоб уникнути TelegramConflictError при
+    # редеплої (старий інстанс ще не встиг зупинитися).
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 
 if __name__ == "__main__":

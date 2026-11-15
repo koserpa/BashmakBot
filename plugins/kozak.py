@@ -198,10 +198,13 @@ async def on_trigger(message: types.Message):
 
 def register_handlers(dp):
     dp.message.register(cmd_kozak, Command("kozak"))
-    dp.message.register(
-        on_trigger,
-        _TRIGGER_RE.search,
-    )
+    # Фільтр для природного тригера: перевіряємо message.text через regex
+    class KozakTriggerFilter(BaseFilter):
+        async def __call__(self, message: Message) -> bool:
+            text = message.text or message.caption or ""
+            return bool(_TRIGGER_RE.search(text))
+
+    dp.message.register(on_trigger, KozakTriggerFilter())
 
 
 def register_watchers(bot, tasks):

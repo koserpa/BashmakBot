@@ -900,7 +900,7 @@ def autologin_configured() -> bool:
     return bool(VULCAN_LOGIN and VULCAN_PASSWORD)
 
 
-def set_cookies(raw: str) -> None:
+async def set_cookies(raw: str) -> None:
     """Живе оновлення cookie-сесії (з авто-логіну) без перезапуску бота.
 
     Оновлюємо module-global (імпортований з config на старті значення
@@ -908,7 +908,7 @@ def set_cookies(raw: str) -> None:
     """
     global VULCAN_COOKIES
     VULCAN_COOKIES = (raw or "").strip()
-    reset_client()
+    await reset_client()
 
 
 # ----------------------------------------------------------------------
@@ -947,7 +947,7 @@ async def try_autologin() -> bool:
         except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             log.warning(f"Vulcan авто-логін: мережева помилка ({type(e).__name__}: {e})")
             return False
-        set_cookies(raw)
+        await set_cookies(raw)
         log.info("Vulcan авто-логін: успішно, сесію оновлено")
         return True
 
@@ -975,10 +975,14 @@ async def get_client() -> VulcanClient:
     return _client
 
 
-def reset_client() -> None:
-    """Скинути клієнт (наприклад, після оновлення VULCAN_COOKIES)."""
+async def reset_client() -> None:
+    """Скинути клієнт (наприклад, після оновлення VULCAN_COOKIES).
+    Закриває відкриту aiohttp-сесію, щоб не лишати unclosed session.
+    """
     global _client
-    _client = None
+    if _client is not None:
+        await _client.close()
+        _client = None
 
 
 def _auth_error_text() -> str:

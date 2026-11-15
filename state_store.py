@@ -90,12 +90,13 @@ def _collect() -> dict[str, Any]:
         "sections": sections,
         # службове: id чекпоінт-документів (щоб вміти чистити старі)
         "_checkpoints": list(_checkpoint_ids),
+        "_checkpoint_day": _checkpoint_day,
     }
 
 
 def _apply(payload: Any) -> int:
     """Розкладає снапшот по секціях. Повертає кількість застосованих."""
-    global _checkpoint_ids
+    global _checkpoint_ids, _checkpoint_day
     if not isinstance(payload, dict):
         raise ValueError("снапшот не є об'єктом")
     if int(payload.get("v") or 0) > STATE_VERSION:
@@ -103,6 +104,10 @@ def _apply(payload: Any) -> int:
     ckpts = payload.get("_checkpoints")
     if isinstance(ckpts, list):
         _checkpoint_ids = [int(x) for x in ckpts if isinstance(x, (int, float))]
+    # Відновлюємо день останнього чекпоінта, щоб не створювати дублікат при рестарті
+    cp_day = payload.get("_checkpoint_day")
+    if isinstance(cp_day, str):
+        _checkpoint_day = cp_day
     sections = payload.get("sections")
     if not isinstance(sections, dict):
         raise ValueError("у снапшоті немає 'sections'")
