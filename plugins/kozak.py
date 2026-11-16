@@ -15,7 +15,8 @@ import re
 import time
 
 from aiogram import types
-from aiogram.filters import Command
+from aiogram.filters import BaseFilter, Command
+from aiogram.types import Message
 
 import bot_state
 from gemini_client import ask_gemini, quota_low, strip_reaction_marker

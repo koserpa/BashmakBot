@@ -21,7 +21,6 @@
   2.11 | 02.11.2026 | 2 листопада | 2 listopada -> конкретна дата
 Префікси-прийменники («на ...») відкидаються.
 """
-import asyncio
 import logging
 import re
 from datetime import date, datetime, timedelta
@@ -240,6 +239,8 @@ async def _reply_day(message: Message, target: date) -> bool:
             # чат «бачив» розклад -> цінна ціль для проактивних сповіщень
             import vulcan_notify
             vulcan_notify.remember_chat(message.chat.id)
+            # картка -> історія: «скільки завтра уроків?» модель порахує з даних
+            _remember_card(message.chat.id, text)
     except vulcan_utils.VulcanDisabled:
         await message.reply(
             "🔐 <b>VULCAN не підключено</b>: змінна <code>VULCAN_COOKIES</code> не задана.\n"
@@ -299,6 +300,7 @@ async def cmd_rozklad_tydzien(message: Message):
         if status == "ok":
             import vulcan_notify
             vulcan_notify.remember_chat(message.chat.id)
+            _remember_card(message.chat.id, text)
     except vulcan_utils.VulcanDisabled:
         await message.reply(
             "🔐 <b>VULCAN не підключено</b>: змінна <code>VULCAN_COOKIES</code> не задана."
@@ -347,6 +349,7 @@ async def cmd_sprawdziany(message: Message):
         status, text = await vulcan_notify.upcoming_events_text(30)
         if status == "ok":
             vulcan_notify.remember_chat(message.chat.id)
+            _remember_card(message.chat.id, text)
     except vulcan_utils.VulcanDisabled:
         await message.reply(
             "🔐 <b>VULCAN не підключено</b>: змінні <code>VULCAN_COOKIES</code> / "
@@ -366,7 +369,7 @@ async def cmd_oceny(message: Message):
         return
     import vulcan_notify
     try:
-        status, text = await vulcan_notify.grades_overview_text()
+        status, text, compact = await vulcan_notify.grades_overview_parts()
     except vulcan_utils.VulcanDisabled:
         await message.reply(
             "🔐 <b>VULCAN не підключено</b>: змінні <code>VULCAN_COOKIES</code> / "
@@ -377,11 +380,16 @@ async def cmd_oceny(message: Message):
         log.warning(f"VULCAN (oceny) помилка: {e}")
         text = "⚠️ <b>VULCAN недоступний</b> — спробуй через хвилину."
         status = "error"
+        compact = ""
     # оцінок за семестр буває багато — шлемо частинами
     parts = (vulcan_notify.split_telegram_message(text)
              if status == "ok" else [text])
     for part in parts:
         await message.reply(part)
+    if status == "ok" and compact:
+        # компакт (без HTML) -> історія: модель зможе відповісти на
+        # «скільки всього оцінок?» з реальних даних, а не вигадки
+        _remember_card(message.chat.id, compact)
 
 
 async def cmd_vulcan_silence(message: Message):
@@ -437,6 +445,54 @@ _TEXT_OCENY_RE = re.compile(
 )
 
 
+# Питання-обчислення («скільки оцінок?», «підрахуй загальну кількість»)
+# — НЕ запит картки: мають піти в AI, який відповість з даних картки
+# в історії чату (див. _remember_card). Без цього «підрахуй кількість
+# оцінок» перехоплювався регексом «оцінк*» і бот просто пересилав картку.
+_COUNT_Q_RE = re.compile(
+    r"(?i)скільки|скока|сколько|пораху|підраху|підщит|подсчита|посчита"
+    r"|переліч|counts?\b|sums?\b"
+)
+
+
+def _is_count_question(text: str) -> bool:
+    """Чи це питання на обчислення (скільки/порахуй), а не запит картки."""
+    return bool(text) and bool(_COUNT_Q_RE.search(text))
+
+
+class CardTextFilter(BaseFilter):
+    """Текстовий тригер картки (регекс) МІНУС питання-обчислення.
+
+    «шо по оцінках» -> картка /oceny; «підрахуй кількість оцінок» ->
+    НЕ перехоплюємо: питання піде в загальний AI-хендлер, і модель
+    відповість з даних картки, записаної в історії (_remember_card).
+    """
+
+    def __init__(self, regex: re.Pattern) -> None:
+        self.regex = regex
+
+    async def __call__(self, message: Message) -> bool:
+        text = message.text or ""
+        if not text or not self.regex.search(text):
+            return False
+        return not _is_count_question(text)
+
+
+def _remember_card(chat_id: int, text: str) -> None:
+    """Записати надіслану VULCAN-картку в історію чату (role=model).
+
+    Плагінні хендлери відповідають поза process_and_reply, тому без цього
+    запису модель не бачить даних картки: наступне «скільки всього оцінок?»
+    або «шо завтра за пари?» залишається без нормальної відповіді.
+    append_history сам обрізає текст до HISTORY_MSG_MAX_CHARS; для /oceny
+    передається компакт (vulcan_notify.grades_compact_text), бо HTML-картка
+    не вміщається і шумить тегами.
+    """
+    if not text:
+        return
+    bot_state.append_history(chat_id, {"role": "model", "parts": [{"text": text}]})
+
+
 def _addressed_to_bot(message: Message) -> bool:
     """Чи звертаються до бота: @username, ім'я-тригер (на початку/в кінці)
     або reply на його повідомлення. Без цього текстові тригери не працюють —
@@ -481,9 +537,9 @@ def register_handlers(dp) -> None:
     dp.message.register(cmd_sprawdziany, Command("sprawdziany", "sprawdzian", "dz"))
     dp.message.register(cmd_oceny, Command("oceny", "grades"))
     dp.message.register(cmd_vulcan_silence, Command("vulcan_silence", "vulcan_mute"))
-    dp.message.register(cmd_rozklad_text, F.text.regexp(_TEXT_TRIGGER_RE), AddressedToBot())
-    dp.message.register(cmd_sprawdziany_text, F.text.regexp(_TEXT_SPZ_RE), AddressedToBot())
-    dp.message.register(cmd_oceny_text, F.text.regexp(_TEXT_OCENY_RE), AddressedToBot())
+    dp.message.register(cmd_rozklad_text, CardTextFilter(_TEXT_TRIGGER_RE), AddressedToBot())
+    dp.message.register(cmd_sprawdziany_text, CardTextFilter(_TEXT_SPZ_RE), AddressedToBot())
+    dp.message.register(cmd_oceny_text, CardTextFilter(_TEXT_OCENY_RE), AddressedToBot())
     dp.callback_query.register(on_vulcan_callback, F.data.startswith("vulcan:"))
 
 

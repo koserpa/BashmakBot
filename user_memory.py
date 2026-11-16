@@ -8,6 +8,10 @@
 
 Приватність: у промпті пряма заборона на здоров'я/гроші/стосунки/сім'ю;
 поле sensitive з профілів видалено (рішення власника 03.11.2026).
+Друга лінія оборони — пост-фільтр is_private(): регулярки на реквізити
+(IBAN, карта, PESEL/телефон) і словник тем-стопів. Приватний факт не
+попадає у снапшот, навіть якщо модель зглітчила. Фільтр свідомо
+консервативний: іноді пропустить невинний факт — це дешевше за витік.
 Кап: USER_MEMORY_MAX_FACTS на людину (старі витісняються), TTL 60 днів.
 
 Секція реєструється на рівні імпорту — state_store.start() відновлює
@@ -152,6 +156,23 @@ def facts_count(user_id: Any = None, username: str | None = None) -> int:
     return len(_facts_for_keys(_candidate_keys(user_id, username)))
 
 
+def forget_user(user_id: Any = None, username: str | None = None) -> int:
+    """/forget_me: стерти всі авто-факти про людину (усі її ключі:
+    id, username, легасі). Повертає, скільки фактів видалено.
+    Пам'ять про КОМПАНІЮ (chat-факти) не чіпає — це спільна історія."""
+    keys = _candidate_keys(user_id, username)
+    if not keys:
+        return 0
+    users = _state.setdefault("users", {})
+    removed = 0
+    for k in keys:
+        removed += len(users.pop(k, None) or [])
+    if removed:
+        state_store.request_save()
+        log.info(f"user_memory: стерто {removed} фактів ({', '.join(keys)})")
+    return removed
+
+
 def get_memory_text(user_id: Any = None, username: str | None = None,
                     full_name: str | None = None) -> str:
     """Пам'ять про людину для інжекту в LLM-контекст (або '').
@@ -185,14 +206,86 @@ def get_chat_facts_text() -> str:
     return "Пам'ять про компанію (з чату, може застаріти):\n" + "\n".join(lines)
 
 
+# ---------------- приватність: пост-фільтр фактів ----------------
+# Промпт витягування вже забороняє здоров'я/гроші/стосунки/сім'ю/релігію,
+# але це лише домовленість із моделлю. is_private() — друга лінія оборони:
+# факт із такою темою або з реквізитами не пишеться у снапшот, навіть якщо
+# модель зглітчила. Свідомо консервативний: іноді пропустить невинний
+# факт — це дешевше, ніж зберегти приватний.
+
+# Реквізити шукаємо у тексті без пробілів/розділових знаків: картки, IBAN
+# і телефони пишуть і «4444 5555 6666 7777», і «4444555566667777».
+_COMPACT_RE = re.compile(r"[\s\-().,]")
+# IBAN (PL61...) або цифрова серія 9+: карта (16), PESEL (11), телефон (9-12)
+_PRIVATE_NUM_RE = re.compile(r"[A-Z]{2}\d{2}[A-Z0-9]{10,30}|\d{9,19}")
+
+# Теми-стопи: підстроки, щоб ловити відмінки UA/RU/PL одразу.
+# Деякі елементи — дрібні регекспи (дужки), бо голий стовбур дає багато
+# хибних спрацювань («брат» ловив би «вибрати», «измен» — «изменение»).
+_PRIVATE_TOPICS_RE = re.compile("|".join((
+    # здоров'я
+    "хвор", "здоров", "болі", "боли", "больн", "болезн", "болить",
+    "лікар", "лекарст", "аптец", "аптек", "таблет", "діагноз",
+    "депрес", "антидепрес", "травм",
+    "chorob", "lekarst", "lekarz", "aptek", "tabletk", "ból", "boli",
+    # гроші
+    "грош", "зарплат", "заробіт", "заробля", "зараб", "борг", "кредит",
+    "позик", "позич", "дохід", "доход", "стипенд", "гонорар", "виплат",
+    "деньг", "денег", "долг", "iban", "pesel",
+    "pieniąd", "pieniadz", "zarobk", "zarabia", "kredyt", "pożyczk",
+    "stypend", "wypłat",
+    # стосунки та сім'я
+    "стосунк", "отношен", "розлуч", "развод", "rozwod", "вагітн",
+    "беремен", "ciąż", "зрад(а|ив|ила|ник)", "одруж", "женит", "заміж",
+    "весілл", "свадьб", "ślub", "wesele",
+    "мамин", "татов", "папин", "батьк", "бабус", "бабушк", "дідус",
+    "дедушк", "сестр", "родин", "родич", "родств",
+    "брата|брату|братом|братові|братья", "семья|семьи|семью|семьей",
+    "brata|bratem", "siostr", "babci", "dziadk", "rodzin", "mamci",
+    # релігія
+    "церкв", "релігі", "религи", "молитв", "богослуж", "kościo",
+    "religi", "msza",
+)), re.IGNORECASE)
+
+
+def is_private(text: str) -> bool:
+    """Чи виглядає факт як приватний: реквізити/номери або заборонена
+    тема (здоров'я, гроші, стосунки, сім'я, релігія)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _PRIVATE_NUM_RE.search(_COMPACT_RE.sub("", t)):
+        return True
+    return bool(_PRIVATE_TOPICS_RE.search(t))
+
+
+def _filter_private(facts: list[str]) -> tuple[list[str], int]:
+    """Прибрати приватні факти зі списку. Повертає (чисті, скільки відкинуто).
+    Зміст відкинутих фактів у логи НЕ пишеться — тільки кількість."""
+    clean: list[str] = []
+    skipped = 0
+    for raw in facts:
+        t = str(raw or "").strip()[:200]
+        if not t:
+            continue
+        if is_private(t):
+            skipped += 1
+            continue
+        clean.append(t)
+    return clean, skipped
+
+
 def _merge_chat(new_facts: list[str], today_iso: str) -> bool:
-    """Дописати факти про компанію (без дублів), кап. True = змінилось."""
+    """Дописати факти про компанію (без дублів), кап. True = змінилось.
+    Приватні факти (is_private) відсіюються до запису."""
+    clean, skipped = _filter_private(new_facts)
+    if skipped:
+        log.info(f"user_memory: відфільтровано приватних фактів (chat): {skipped}")
     cur = list(_state.get("chat") or [])
     seen = {str(f.get("t") or "").strip().lower() for f in cur}
     changed = False
-    for t in new_facts:
-        t = str(t or "").strip()[:200]
-        if not t or t.lower() in seen:
+    for t in clean:
+        if t.lower() in seen:
             continue
         cur.append({"t": t, "d": today_iso})
         seen.add(t.lower())
@@ -290,14 +383,17 @@ def _prune(users: dict[str, list[dict]], today: datetime) -> dict[str, list[dict
 
 
 def _merge_facts(username: str, new_facts: list[str], today_iso: str) -> bool:
-    """Дописати нові факти (без дублів), кап на кількість. True = змінилось."""
+    """Дописати нові факти (без дублів), кап на кількість. True = змінилось.
+    Приватні факти (is_private) відсіюються до запису."""
     users = _state.setdefault("users", {})
+    clean, skipped = _filter_private(new_facts)
+    if skipped:
+        log.info(f"user_memory: відфільтровано приватних фактів ({username}): {skipped}")
     cur = list(users.get(username) or [])
     seen = {str(f.get("t") or "").strip().lower() for f in cur}
     changed = False
-    for t in new_facts:
-        t = str(t or "").strip()[:200]
-        if not t or t.lower() in seen:
+    for t in clean:
+        if t.lower() in seen:
             continue
         cur.append({"t": t, "d": today_iso})
         seen.add(t.lower())

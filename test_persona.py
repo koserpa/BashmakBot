@@ -155,6 +155,28 @@ def test_utility_calls_ignore_persona() -> None:
     print("  службові виклики поза персоною + ядро/характер ✓")
 
 
+def test_identity_only_in_characters() -> None:
+    """«Хто я» (бот / не бот) живе ТІЛЬКИ в character-блоках персон:
+    CORE_PROMPT не містить заяв про особу, тож зібраний промпт
+    (ядро + характер) ніколи не суперечить сам собі. Регресія: якщо
+    хтось допише «Ти бот»/«НЕ бот» у ядро — впаде тест, а не чат."""
+    core = config.CORE_PROMPT.lower()
+    assert "ти бот" not in core and "не бот" not in core, \
+        "заява про особу має жити в character-блоці, не в ядрі"
+
+    blocks = (
+        config.BASHMAK_CHARACTER_PROMPT,
+        config.GOGA_CHARACTER_PROMPT,
+        config.ROZA_CHARACTER_PROMPT,
+        config.KOZAK_CHARACTER_PROMPT,
+    )
+    for blk in blocks:
+        low = blk.lower()
+        assert ("ти бот" in low) or ("не бот" in low), \
+            "кожен характер має рівно свою заявку про особу"
+    print("  особа заявлена лише в характерах, ядро нейтральне ✓")
+
+
 if __name__ == "__main__":
     test_personas_registry()
     test_toggle_cycle()
@@ -164,5 +186,6 @@ if __name__ == "__main__":
     test_snapshot_roundtrip_and_garbage()
     test_gemini_client_uses_persona()
     test_utility_calls_ignore_persona()
+    test_identity_only_in_characters()
     print("ALL TESTS OK")
     sys.exit(0)

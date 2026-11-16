@@ -75,7 +75,7 @@ def test_build_url() -> None:
     q = urllib.parse.parse_qs(url.split("?", 1)[1])
     assert "returnUrl" in q and "wa=wsignin1.0" in q["returnUrl"][0]
     assert "Fs/Ls" in q["returnUrl"][0]
-    print(f"  login URL: закодований, один '?', returnUrl цілий ✓")
+    print("  login URL: закодований, один '?', returnUrl цілий ✓")
 
 
 def test_parse_login_page() -> None:

@@ -16,11 +16,9 @@ LIVE-тест з реальным сайтом виконується ТОЛЬК
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date
 
 import vulcan_utils as vu
 from vulcan_utils import (

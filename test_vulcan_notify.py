@@ -433,6 +433,55 @@ def test_oceny_triggers() -> None:
     print("  текстові тригери оцінок ✓")
 
 
+def test_count_questions_go_to_ai() -> None:
+    """«Підрахуй кількість оцінок» — це питання, а не запит картки.
+
+    Раніше регекс «оцінк*» перехоплював його і бот просто пересилав
+    картку. Тепер CardTextFilter пропускає такі питання в AI, який
+    відповідає з компакт-картки в історії чату."""
+    import plugins.vulcan as pv
+    counted = [
+        "підрахуй загальну кількість оцінок",
+        "скільки оцінок в мене всього",
+        "скільки оцінок",
+        "порахуй оцінки за семестр",
+        "бот підщитай кількість оцінок",
+        "сколько оценок",
+        "bot count grades",
+    ]
+    for t in counted:
+        assert pv._is_count_question(t), f"має йти в AI, а не в картку: {t!r}"
+    # навіть коли регекс фразу ловить («покажи...» на початку), наявність
+    # «порахуй/скільки» віддає її в AI — не перехоплюємо карткою
+    mixed = "покажи оцінки і порахуй їх кількість"
+    assert pv._TEXT_OCENY_RE.search(mixed)
+    assert pv._is_count_question(mixed)
+    # звичайні запити картки — не «обчислення»
+    for t in ("шо по оцінках", "бот покажи оцінки", "які оцінки"):
+        assert not pv._is_count_question(t), f"хибне спрацювання: {t!r}"
+    print("  питання-обчислення йдуть в AI, а не перехоплюються карткою ✓")
+
+
+def test_grades_compact_history_text() -> None:
+    """Компакт для історії чату: кількість угорі, без HTML, групування
+    по предметах, обрізання під ліміт історії."""
+    grades = [
+        grade(subject="Matematyka", value="5"),
+        grade(subject="Matematyka", value="4"),
+        grade(subject="Fizyka", value="3"),
+    ]
+    text = vn.grades_compact_text(grades, {"numerOkresu": 1})
+    assert text.startswith("Всього оцінок: 3") and "(semestr 1)" in text
+    assert "Matematyka: 5, 4" in text and "Fizyka: 3" in text
+    assert "<b>" not in text and "&amp;" not in text
+    # багато оцінок — обрізається з позначкою
+    many = [grade(subject=f"Subjekt {i:03d}", value="5") for i in range(120)]
+    trimmed = vn.grades_compact_text(many, None)
+    assert len(trimmed) <= 780 and trimmed.endswith("…")
+    assert vn.grades_compact_text([], None) == "Оцінок за семестр немає"
+    print("  компакт оцінок для історії чату ✓")
+
+
 def test_tomorrow_marks_only_after_delivery() -> None:
     """Нагадування «завтра» фіксується лише після успішної доставки.
 
@@ -560,6 +609,8 @@ if __name__ == "__main__":
     test_grades_card()
     test_grades_overview()
     test_oceny_triggers()
+    test_count_questions_go_to_ai()
+    test_grades_compact_history_text()
     test_changes_card_substitution()
     print("ALL TESTS OK")
     sys.exit(0)

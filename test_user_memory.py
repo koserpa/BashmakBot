@@ -157,6 +157,43 @@ def test_merge_dedupe_cap_ttl() -> None:
     print("  merge/cap/TTL фактів ✓")
 
 
+def test_privacy_filter() -> None:
+    """Пост-фільтр приватності: реквізити і заборонені теми не пишуться
+    у снапшот, невинні факти проходять (друга лінія після промпта)."""
+    # реквізити/номери — у різних форматах запису
+    assert um.is_private("мій рахунок PL61 1090 1014 0000 0712 1981 2874")
+    assert um.is_private("карта 4444 5555 6666 7777")
+    assert um.is_private("телефон +48 123 456 789")
+    assert um.is_private("його PESEL 90010112345")
+    assert um.is_private("номер 093123456")          # 9 цифр підряд
+    # теми-стопи: здоров'я / гроші / стосунки / сім'я / релігія
+    assert um.is_private("взяв кредит у банку")
+    assert um.is_private("лежав у лікарні тиждень")
+    assert um.is_private("у нього депресія")
+    assert um.is_private("поїхав до бабусі на тиждень")
+    assert um.is_private("одружився минулого місяця")
+    assert um.is_private("зарплата піднялась")
+    assert um.is_private("ходит до церкви по неділях")
+    # невинні — мають проходити
+    assert not um.is_private("купив нову відеокарту")
+    assert not um.is_private("грають у CS разом по вечорах")
+    assert not um.is_private("готує презентацію на п'ятницю")
+    assert not um.is_private("малує 3D у блендері")
+    assert not um.is_private("переїжджає 1 вересня 2025 року")
+    assert not um.is_private("вибрати участь у хакатоні")  # «брата» не ловиться
+    assert not um.is_private("7 листопада 2026")
+
+    # на рівні злиття: приватне відсікається, решта пишеться
+    um._state = {"last_run": "", "users": {}, "chat": []}
+    assert um._merge_facts(
+        "koserpa", ["взяв кредит 5000", "купив клавіатуру"], "2026-11-05")
+    assert [f["t"] for f in um._state["users"]["koserpa"]] == ["купив клавіатуру"]
+    assert um._merge_chat(
+        ["мій номер +48 123 456 789", "грають у CS"], "2026-11-05")
+    assert [f["t"] for f in um._state["chat"]] == ["грають у CS"]
+    print("  приватність: пост-фільтр is_private + злиття ✓")
+
+
 def test_registry_and_migration() -> None:
     """Реєстр за user_id: працює без @username; легасі-факти мігрують
     під id-ключ при першій появі людини."""
@@ -274,6 +311,37 @@ def test_snapshot_survives_garbage() -> None:
     print("  битий снапшот не шкодить ✓")
 
 
+def test_forget_me() -> None:
+    """/forget_me: forget_user зносить факти по ВСІХ ключах людини
+    (id + легасі-username), інших людей і chat-факти не чіпає."""
+    um._state = {"last_run": "", "users": {
+        "id:222": [{"t": "факт за id", "d": "2026-11-05"}],
+        # легасі: той самий юзер, факти ще під старим username-ключем
+        "oldnick": [{"t": "факт за легасі-ключем", "d": "2026-10-01"}],
+        "id:333": [{"t": "факт іншої людини", "d": "2026-11-06"}],
+    }, "chat": [{"t": "грають у CS", "d": "2026-11-05"}]}
+    um._users = {}  # без note_user: легасі-ключ не мігрує (цей кейс і тестуємо)
+
+    # видаляє обидва ключі одразу, повертає сумарну кількість
+    assert um.forget_user(222, "oldnick") == 2
+    assert "id:222" not in um._state["users"]
+    assert "oldnick" not in um._state["users"]
+    # чужі факти й компанія — недоторкані
+    assert um.facts_count(user_id=333) == 1
+    assert [f["t"] for f in um._state["chat"]] == ["грають у CS"]
+
+    # невідома людина — нічого не видаляється, 0
+    assert um.forget_user(999, "ghost") == 0
+
+    # людина з реєстром: id-ключ перекриває username — обидва варіанти чисті
+    um._state["users"] = {"id:444": [{"t": "факт", "d": "2026-11-05"}]}
+    um._users = {"id:444": {"username": "nick", "name": "Ніко"}}
+    assert um.forget_user(444, "NICK") == 1
+    assert um.facts_count(user_id=444) == 0
+    assert um.facts_count(username="nick") == 0
+    print("  /forget_me: forget_user по всіх ключах, чужих не чіпає ✓")
+
+
 def test_prompt_content() -> None:
     """Промпт: ростер з іменами з реєстру, заборона приватного, JSON-формат."""
     um._users = {"id:111": {"username": "koserpa", "name": "Костя Кравченко"},
@@ -294,6 +362,8 @@ if __name__ == "__main__":
     test_chat_facts()
     test_history_message_cap()
     test_merge_dedupe_cap_ttl()
+    test_privacy_filter()
+    test_forget_me()
     test_registry_and_migration()
     test_memory_text_and_no_username()
     test_run_once_with_fake_gemini()

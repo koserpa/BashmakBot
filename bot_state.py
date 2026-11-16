@@ -22,7 +22,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from config import (
-    HISTORY_SIZE,
     HISTORY_PERSIST_ENABLED,
     HISTORY_SUMMARY_THRESHOLD,
     HISTORY_RECENT_KEEP,

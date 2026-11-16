@@ -1,10 +1,7 @@
 """Simple plugin example: replies to /hello command."""
 
-from aiogram import types
-from aiogram.filters import Command
 from aiogram.types import Message
 
-from config import ADMIN_USERNAME
 
 
 async def cmd_hello(message: Message):

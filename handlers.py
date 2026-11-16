@@ -29,7 +29,7 @@ import user_memory
 import user_profiles
 from config import (
     ADMIN_USERNAME, GEMINI_MODEL, GEMINI_RPD_LIMIT, TTS_RPD_LIMIT,
-    TRIGGER_NAMES,
+    TRIGGER_NAMES, USER_MEMORY_ENABLED,
 )
 from features import (
     REACT_UNPROMPTED_CHANCE,
@@ -508,6 +508,17 @@ async def dispatch_media_event(
     )
 
 
+async def _reply_context(bot: Bot, message: Message) -> tuple[list, str]:
+    """Контекст ЧУЖОГО повідомлення, на яке реплаять (текст і медіа).
+    Реплай на саме повідомлення бота контексту не дає — це розмова з ним.
+    Використовується в тексті/фото/стікері/гіфці: без нього реплай на
+    чуже повідомлення медіа-типом відповідав би «наосліп»."""
+    replied = message.reply_to_message
+    if not replied or (replied.from_user and replied.from_user.id == bot_state.BOT_ID):
+        return [], ""
+    return await build_reply_media_context(bot, replied, transcribe_media)
+
+
 async def send_idle_message(bot: Bot, chat_id: int) -> None:
     """Формує і надсилає одне проактивне повідомлення в тихий чат."""
     contents = bot_state.get_recent_context(chat_id)
@@ -619,7 +630,9 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             "/remind 15m текст — поставити нагадування через 15 хв (є і 1h30m, і 18:00)\n"
             "/reminders — список активних нагадувань у чаті\n"
             "/remind_del номер — скасувати нагадування\n"
-            "/gadalka — робе прогноз на основі історії чата і контекста"
+            "/gadalka — робе прогноз на основі історії чата і контекста\n"
+            "/my_memory — шо я запам'ятав про тебе\n"
+            "/forget_me — стерти мою пам'ять про тебе"
         )
         # Адмінські команди — окремо під /admin (тільки адмін може викликати)
         await message.answer(text)
@@ -842,6 +855,11 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
         lines.append(f"🫀 Фонові циклі: {alive}")
         persona_name = persona.mode_name()
         lines.append(f"🎭 Персона: {persona_name}")
+        if USER_MEMORY_ENABLED:
+            facts = user_memory.facts_count(
+                message.from_user.id,
+                message.from_user.username if message.from_user else None)
+            lines.append(f"🧠 Пам'ять про тебе: {facts} факт(ів) — /my_memory покаже")
 
         await message.answer("\n".join(lines))
 
@@ -883,6 +901,46 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             get_current_date_str(),
         )
         await message.reply(f"🔮 {answer}")
+
+    @dp.message(Command("my_memory"))
+    async def cmd_my_memory(message: Message):
+        """/my_memory: що бот запам'ятав про людину (авто-факти + профіль)."""
+        if not message.from_user:
+            return
+        user = message.from_user
+        style = user_profiles.get_style(user.id, user.username)
+        mem = user_memory.get_memory_text(user.id, user.username, user.full_name)
+        lines = []
+        if style:
+            lines.append("👤 <b>Твій профіль</b> (заданий через /profile у адміна):")
+            lines.append(f"<i>{style}</i>")
+        if mem:
+            lines.append(("🧠 <b>Що я запам'ятав з чату</b>:"
+                          if not style else "\n🧠 <b>З чату</b>:"))
+            lines.append(f"<i>{mem}</i>")
+        if not lines:
+            lines.append(
+                "🧠 Про тебе я ще нічого не знаю. Спілкуйся — і я запам'ятаю "
+                "(без приватного: здоров'я, гроші, стосунки я не записую).")
+        lines.append("\nСтерти все: /forget_me")
+        await message.answer("\n".join(lines))
+
+    @dp.message(Command("forget_me"))
+    async def cmd_forget_me(message: Message):
+        """/forget_me: стерти авто-факти і динамічний профіль людини."""
+        if not message.from_user:
+            return
+        user = message.from_user
+        removed = user_memory.forget_user(user.id, user.username)
+        user_profiles.delete_profile(
+            user_id=user.id, username=(user.username or "").lower())
+        if removed:
+            await message.answer(
+                f"🧹 Забув про тебе все ({removed} факт(ів)). "
+                "Якщо шо — почну запам'ятовувати заново.")
+        else:
+            await message.answer(
+                "🤷 Про тебе я й так нічого не знав. Але тепер точно не знаю.")
 
     # /rozklad та /rozklad_* обробляє плагін vulcan (реальний розклад
     # із Dziennik VULCAN); тут статичного фолбеку більше немає.
@@ -936,17 +994,11 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             if not question:
                 question = "Привіт! Про що поговоримо?"
 
-            extra_parts: list = []
-            replied = message.reply_to_message
-            if replied and (not replied.from_user or replied.from_user.id != bot_state.BOT_ID):
-                reply_parts, reply_description = await build_reply_media_context(
-                    bot, replied, transcribe_media
-                )
-                if reply_description:
-                    question = f"{question}\n{reply_description}" if question else reply_description
-                    extra_parts = reply_parts
+            reply_parts, reply_description = await _reply_context(bot, message)
+            if reply_description:
+                question = f"{question}\n{reply_description}" if question else reply_description
 
-            return question, (extra_parts or None), question
+            return question, (reply_parts or None), question
 
         await dispatch_media_event(
             bot, message, sender,
@@ -967,6 +1019,10 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             if image_bytes is None:
                 return None
             extra_parts = [types.Part.from_bytes(data=image_bytes, mime_type=IMAGE_MIME_JPEG)]
+            reply_parts, reply_description = await _reply_context(bot, message)
+            if reply_description:
+                question = f"{question}\n{reply_description}"
+                extra_parts.extend(reply_parts)
             return question, extra_parts, f"[фото] {question}"
 
         await dispatch_media_event(
@@ -1002,6 +1058,14 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
             if sticker_bytes is None:
                 return None
             extra_parts = [types.Part.from_bytes(data=sticker_bytes, mime_type="image/webp")]
+            reply_parts, reply_description = await _reply_context(bot, message)
+            if reply_description:
+                extra_parts.extend(reply_parts)
+                return (
+                    f"[надіслав(-ла) стікер {emoji}] на повідомлення:\n{reply_description}",
+                    extra_parts,
+                    f"[надіслав(-ла) стікер {emoji}]",
+                )
             return (
                 f"[надіслав(-ла) стікер, емодзі: {emoji}]",
                 extra_parts,
@@ -1034,6 +1098,10 @@ def register_handlers(dp: Dispatcher, bot: Bot) -> None:
 
             question = strip_trigger(caption, bot_state.BOT_USERNAME) or "Що відбувається на цій гіфці?"
             extra_parts = [types.Part.from_bytes(data=animation_bytes, mime_type="video/mp4")]
+            reply_parts, reply_description = await _reply_context(bot, message)
+            if reply_description:
+                question = f"{question}\n{reply_description}"
+                extra_parts.extend(reply_parts)
             return question, extra_parts, f"[гіфка] {question}"
 
         await dispatch_media_event(

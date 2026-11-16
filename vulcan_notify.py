@@ -652,23 +652,55 @@ def format_grades_overview(grades: list[dict], period: dict | None) -> str:
     return head + "\n\n" + "\n\n".join(blocks)
 
 
-async def grades_overview_text() -> tuple[str, str]:
-    """Публічний API для хендлера /oceny: всі оцінки за поточний семестр.
+def grades_compact_text(grades: list[dict], period: dict | None) -> str:
+    """Компактний текст огляду оцінок (без HTML) для історії чату.
 
-    Повертає (status, html) — той самий контракт, що schedule_text.
-    Сесію відновлює grades_snapshot (авто-логін усередині).
+    Картка /oceny надсилається поза process_and_reply, тому без такого
+    запису модель у наступному питанні («скільки всього оцінок?») не бачить
+    даних і вигадує. Компакт починається з готової кількості, тож модель
+    рахує з реальних даних, а не з повітря. Ліміту історії (800 симв.)
+    вміщається.
     """
+    if not grades:
+        return "Оцінок за семестр немає"
+    by_subject: dict[str, list[str]] = {}
+    for g in grades:
+        by_subject.setdefault(str(g.get("subject") or "?"), []).append(
+            str(g.get("value") or "?"))
+    head = f"Всього оцінок: {len(grades)}"
+    num = (period or {}).get("numerOkresu")
+    if num:
+        head += f" (semestr {num})"
+    body = "; ".join(
+        f"{subj}: {', '.join(vals)}" for subj, vals in sorted(by_subject.items()))
+    text = f"{head}. {body}"
+    return text if len(text) <= 780 else text[:777] + "…"
+
+
+async def grades_overview_parts() -> tuple[str, str, str]:
+    """(status, html-картка для чату, компактний текст для історії)."""
     try:
         snap = await vu.grades_snapshot()
     except vu.VulcanDisabled:
         raise
     except (vu.VulcanAuthError, vu.VulcanUnavailable, vu.VulcanBadData) as e:
-        return "error", vu._error_text(e)
+        return "error", vu._error_text(e), ""
 
     body = format_grades_overview(snap.get("grades") or [], snap.get("period"))
+    compact = grades_compact_text(snap.get("grades") or [], snap.get("period"))
     if not body:
-        return "ok", "📊 <b>Оцінок за цей семестр ще немає</b> (Dziennik VULCAN)."
-    return "ok", body
+        return ("ok", "📊 <b>Оцінок за цей семестр ще немає</b> (Dziennik VULCAN).",
+                compact)
+    return "ok", body, compact
+
+
+async def grades_overview_text() -> tuple[str, str]:
+    """Публічний API для хендлера /oceny: (status, html) — той самий
+    контракт, що schedule_text. Сесію відновлює grades_snapshot
+    (авто-логін усередині). Для картки + історії чату див.
+    grades_overview_parts()."""
+    status, html, _compact = await grades_overview_parts()
+    return status, html
 
 
 def split_telegram_message(text: str, limit: int = 3800) -> list[str]:
@@ -1040,7 +1072,7 @@ async def _grades_cycle(bot) -> bool:
         _mark_grades_poll(True, error="немає цілей (STATE_CHAT_ID/VULCAN_GRADES_CHATS)")
         return True
     try:
-        client = await vu.get_client()
+        await vu.get_client()
         try:
             snap = await vu.grades_snapshot()
         except vu.VulcanAuthError:
@@ -1048,7 +1080,7 @@ async def _grades_cycle(bot) -> bool:
                 _mark_grades_poll(False, error="сесія мертва, автологін не вдався")
                 log.warning("Vulcan grades: сесія мертва, авто-логін не вдався")
                 return False
-            client = await vu.get_client()
+            await vu.get_client()
             snap = await vu.grades_snapshot()
     except vu.VulcanDisabled:
         _mark_grades_poll(False, error="VULCAN не налаштований")

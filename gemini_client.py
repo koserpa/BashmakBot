@@ -26,9 +26,10 @@ GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
 
 # Ліміт ВІДПОВІДІ (output), а не запиту. ВАЖЛИВО: у thinking-моделей роздуми
 # теж їдять цей ліміт — при 1024 бот інколи обрізав відповідь посеред речення
-# або повертав пустку (finish_reason=MAX_TOKENS). Піднімається тут же, без
-# заміни коду: GEMINI_MAX_OUTPUT=2048 (чи вище) у .env.
-GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT", "1024") or "1024")
+# або повертав пустку (finish_reason=MAX_TOKENS). Дефолт 2048: роздуми + нормальна
+# відповідь вміщуються; міняється тут же, без заміни коду:
+# GEMINI_MAX_OUTPUT=4096 (чи вище) у .env.
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT", "2048") or "2048")
 
 log = logging.getLogger("Bashma4ek_Bot.gemini")
 
@@ -61,6 +62,30 @@ ALLOWED_REACTIONS = {
 }
 
 _gemini_sem = asyncio.Semaphore(5)
+
+
+def _log_usage(response, label: str) -> None:
+    """Логувати витрату токенів одного запиту Gemini.
+
+    Без цього не видно, що жере квоту: чат, сумаризація історії, транскрипція
+    чи дешеві перевірки (реакції/класифікатор). usage_metadata віддає
+    prompt/candidates/thoughts/total — thought-токени в free-квоті теж
+    рахуються, тому важливо їх бачити. Помилки логування не ламають запит.
+    """
+    try:
+        u = getattr(response, "usage_metadata", None)
+        if not u:
+            return
+        parts = []
+        for name in ("prompt_token_count", "cached_content_token_count",
+                     "candidates_token_count", "thoughts_token_count",
+                     "total_token_count"):
+            val = getattr(u, name, None)
+            if val:
+                parts.append(f"{name.removesuffix('_token_count')}={val}")
+        log.info(f"Gemini usage [{label}]: {', '.join(parts)}")
+    except Exception:
+        log.debug("usage_metadata недоступний", exc_info=True)
 
 
 async def ask_gemini(contents, current_date_str, *, use_persona: bool = True,
@@ -281,6 +306,7 @@ async def _ask_gemini_inner(contents: list, current_date_str: str,
                 ),
             )
             text = (response.text or "").strip()
+            _log_usage(response, "ask")
             if text:
                 return text
 
@@ -340,6 +366,7 @@ async def synthesize_speech(text: str) -> bytes | None:
             ),
         )
         pcm = response.candidates[0].content.parts[0].inline_data.data
+        _log_usage(response, "tts")
     except Exception:
         log.exception("Не вдалось згенерувати озвучку відповіді")
         return None
@@ -377,6 +404,7 @@ async def transcribe_media(data: bytes, mime_type: str, kind_label: str) -> str:
             contents=contents,
             config=types.GenerateContentConfig(max_output_tokens=400, temperature=0.2),
         )
+        _log_usage(response, f"transcribe:{kind_label}")
         return (response.text or "").strip()
     except Exception:
         log.exception(f"Транскрибування ({kind_label}) не вдалося")
@@ -407,6 +435,7 @@ async def check_reaction_worthy(sender: str, content_text: str) -> str | None:
             config=types.GenerateContentConfig(max_output_tokens=10, temperature=0.4),
         )
         answer = (response.text or "").strip()
+        _log_usage(response, "react-check")
     except Exception:
         log.exception("Не вдалось перевірити доречність незапитаної реакції")
         return None
@@ -466,6 +495,7 @@ async def classify_search_query(text: str, history_snippet: list[dict]) -> str |
             config=types.GenerateContentConfig(max_output_tokens=20, temperature=0.1),
         )
         answer = (response.text or "").strip().strip('"').strip("'").rstrip(".")
+        _log_usage(response, "classify")
     except Exception:
         log.exception("Не вдалось класифікувати пошуковий запит")
         return None
